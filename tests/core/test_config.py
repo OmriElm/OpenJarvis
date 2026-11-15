@@ -512,6 +512,8 @@ class TestSchedulerConfig:
             "enabled = true\n"
             'schedule = "30 7 * * *"\n'
             'timezone = "Asia/Jerusalem"\n'
+            'style = "text"\n'
+            "max_words = 350\n"
             'deliver_to = ["telegram:123", "telegram:-1005"]\n'
             "\n"
             "[scheduler]\n"
@@ -523,6 +525,8 @@ class TestSchedulerConfig:
         assert cfg.digest.enabled is True
         assert cfg.digest.schedule == "30 7 * * *"
         assert cfg.digest.timezone == "Asia/Jerusalem"
+        assert cfg.digest.style == "text"
+        assert cfg.digest.max_words == 350
         assert cfg.digest.deliver_to == ["telegram:123", "telegram:-1005"]
         assert cfg.scheduler.enabled is True
         assert cfg.scheduler.misfire_grace_seconds == 900

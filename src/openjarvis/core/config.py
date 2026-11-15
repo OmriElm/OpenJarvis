@@ -1753,6 +1753,12 @@ class DigestConfig:
         default_factory=lambda: ["github", "financial", "music", "fitness"]
     )
     honorific: str = "sir"
+    # "spoken" is a prose script for text-to-speech (the historical default).
+    # "text" is a scannable plain-text message for a chat channel. Unknown
+    # values are treated as spoken when the digest is generated.
+    style: str = "spoken"
+    # Word budget for the whole briefing. The spoken default is 200.
+    max_words: int = 200
     voice_id: str = ""
     voice_speed: float = 1.0
     tts_backend: str = "cartesia"

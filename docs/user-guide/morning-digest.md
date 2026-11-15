@@ -161,6 +161,8 @@ Set `deliver_to` to push the generated text. Each entry is `channel:destination`
 
 ```toml
 [digest]
+style = "text"                  # "spoken" (default) or "text"
+max_words = 350                 # default 200, which suits a spoken script
 deliver_to = ["telegram:123456789"]
 
 [channel.telegram]
@@ -170,6 +172,14 @@ allowed_chat_ids = "123456789"
 ```
 
 Delivery runs when a scheduled digest succeeds, after `jarvis digest --fresh`, after `jarvis scheduler run-task morning_digest`, and after `POST /api/digest/generate`. An empty `deliver_to` leaves the digest on disk only. A network failure is logged and does not fail generation.
+
+### Spoken and text styles
+
+`style = "spoken"` is the default. The model writes one short prose briefing: no Markdown, emoji, bullets, or headings, under `max_words` (default 200). That text is what is stored, shown, and sent to the speech engine.
+
+`style = "text"` is for a chat channel such as Telegram. The stored and delivered message is plain text meant to be scanned: one emoji heading per section, one short line per item, and mail grouped into things that need attention, quieter updates (deliveries keep their tracking numbers), and promotions or likely spam. It does not use Markdown, so asterisks and hash marks are not left sitting in the chat. Headings are written in the persona's language. A Hebrew persona stays in Hebrew. The English layout rules do not translate the briefing. A persona file that forbids emoji because it was written for speech is overridden for this message only. The language, tone, and honorific still apply. The same zero-hallucination rules apply: nothing is labeled phishing, and no tracking number appears, unless the collected data supports it.
+
+Speech still gets a spoken script when `style = "text"`. That script is a rewrite of the text message, not a second reading of the raw data, so it cannot add facts the message left out. It is used only for audio. The saved digest and the channel delivery stay the scannable text. If the rewrite fails, the speech engine receives the text message with emoji and list markers removed.
 
 Find the chat id by messaging the bot, then reading `jarvis channel` logs, or from Telegram's `getUpdates` while the bot is not already polling.
 

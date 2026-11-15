@@ -204,6 +204,8 @@ class QueryOrchestrator:
                     "voice_speed": dc.voice_speed,
                     "tts_backend": dc.tts_backend,
                     "honorific": dc.honorific,
+                    "style": dc.style,
+                    "max_words": dc.max_words,
                 }
             )
             from openjarvis.tools.digest_collect import DigestCollectTool

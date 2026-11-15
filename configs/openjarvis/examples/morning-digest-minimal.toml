@@ -25,6 +25,8 @@ voice_id = "onyx"
 sections = ["messages", "calendar"]
 # timezone = "Asia/Jerusalem"          # IANA name used for the cron schedule
 # schedule = "0 7 * * *"               # local time in timezone
+# style = "text"                       # "spoken" (default) or scannable "text"
+# max_words = 350
 # deliver_to = ["telegram:123456789"]  # token: [channel.telegram] or TELEGRAM_BOT_TOKEN
 #
 # `jarvis serve` runs this schedule. A miss fires once if the process

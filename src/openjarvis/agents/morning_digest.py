@@ -7,6 +7,8 @@ the LLM (narrative synthesis), and text_to_speech (audio generation).
 from __future__ import annotations
 
 import json
+import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
@@ -17,6 +19,13 @@ from openjarvis.core.paths import get_config_dir
 from openjarvis.core.registry import AgentRegistry
 from openjarvis.core.types import Message, Role, ToolCall
 
+logger = logging.getLogger(__name__)
+
+STYLE_SPOKEN = "spoken"
+STYLE_TEXT = "text"
+_DIGEST_STYLES = frozenset({STYLE_SPOKEN, STYLE_TEXT})
+DEFAULT_MAX_WORDS = 200
+
 _SECTION_PROMPTS = {
     "messages": "MESSAGES — Prioritize provided messages or tasks needing action.",
     "calendar": "CALENDAR — Cover only provided upcoming events.",
@@ -25,9 +34,23 @@ _SECTION_PROMPTS = {
     "music": "MUSIC — Summarize only provided listening information.",
 }
 
+# Markers that make a phone message look like unparsed Markdown, plus emoji
+# that a speech engine would read aloud or skip awkwardly.
+_MARKDOWN_HEADING = re.compile(r"^#{1,6}\s+", re.MULTILINE)
+_LIST_MARKER = re.compile(r"^\s*[-*•]\s+", re.MULTILINE)
+_EMPHASIS = re.compile(r"\*{1,2}([^*]+)\*{1,2}")
+_EMOJI = re.compile(
+    "[\U0001f300-\U0001faff\U00002600-\U000027bf\U0001f1e6-\U0001f1ff\ufe0f]+",
+    flags=re.UNICODE,
+)
+
 
 def _load_persona(persona_name: str) -> str:
-    """Load a persona prompt file by name."""
+    """Load a persona prompt file by name.
+
+    The file is read as UTF-8 so a non-English persona (for example Hebrew)
+    is not decoded with the Windows locale encoding.
+    """
     search_paths = [
         Path("configs/openjarvis/prompts/personas") / f"{persona_name}.md",
         get_config_dir() / "prompts" / "personas" / f"{persona_name}.md",
@@ -36,6 +59,249 @@ def _load_persona(persona_name: str) -> str:
         if p.exists():
             return p.read_text(encoding="utf-8")
     return ""
+
+
+def normalize_digest_style(value: Any) -> str:
+    """Return ``spoken`` or ``text``.
+
+    Anything else is logged and treated as ``spoken``, which is the
+    historical briefing. The logged value is truncated so a huge string
+    cannot flood the log.
+
+    Parameters
+    ----------
+    value:
+        Raw ``digest.style`` setting.
+
+    Returns
+    -------
+    str
+        ``spoken`` or ``text``.
+    """
+    if not isinstance(value, str):
+        logger.warning(
+            "Invalid digest style (%s); using spoken",
+            type(value).__name__,
+        )
+        return STYLE_SPOKEN
+    style = value.strip().lower()
+    if style in _DIGEST_STYLES:
+        return style
+    shown = style if len(style) <= 40 else style[:37] + "..."
+    logger.warning("Invalid digest style %r; using spoken", shown)
+    return STYLE_SPOKEN
+
+
+def normalize_max_words(value: Any) -> int:
+    """Return a positive word budget, or the default of 200.
+
+    Parameters
+    ----------
+    value:
+        Raw ``digest.max_words`` setting.
+
+    Returns
+    -------
+    int
+        A word limit of at least 1.
+    """
+    if isinstance(value, bool) or value is None:
+        logger.warning(
+            "Invalid digest max_words (%s); using %d",
+            type(value).__name__,
+            DEFAULT_MAX_WORDS,
+        )
+        return DEFAULT_MAX_WORDS
+    if isinstance(value, str):
+        value = value.strip()
+    try:
+        words = int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid digest max_words (%s); using %d",
+            type(value).__name__,
+            DEFAULT_MAX_WORDS,
+        )
+        return DEFAULT_MAX_WORDS
+    if words < 1:
+        logger.warning(
+            "digest max_words must be positive (got %d); using %d",
+            words,
+            DEFAULT_MAX_WORDS,
+        )
+        return DEFAULT_MAX_WORDS
+    return words
+
+
+def _section_block(sections: List[str]) -> str:
+    """Return the configured-section lines, in first-seen order."""
+    ordered = dict.fromkeys(
+        str(section).strip().casefold() for section in sections if str(section).strip()
+    )
+    lines = [
+        f"- {_SECTION_PROMPTS.get(section, section.upper())}" for section in ordered
+    ]
+    return "\n".join(lines) if lines else "- None"
+
+
+def digest_format_instructions(
+    style: str,
+    max_words: int,
+    *,
+    include_messages: bool,
+) -> str:
+    """Return the format half of the digest system prompt.
+
+    ``spoken`` is a single prose briefing for text-to-speech. ``text`` is a
+    scannable plain-text message. Both keep the zero-hallucination rules.
+    The text layout tells the model to write headings in the persona's
+    language so an English instruction block does not flip a Hebrew persona
+    back to English.
+
+    Parameters
+    ----------
+    style:
+        Already normalized ``spoken`` or ``text``.
+    max_words:
+        Positive word budget for the whole briefing.
+    include_messages:
+        When true, the text layout also requires the mail groups.
+
+    Returns
+    -------
+    str
+        Format instructions, including the absolute rules.
+    """
+    shared = (
+        "ABSOLUTE RULES (violations are unacceptable):\n"
+        "- ONLY facts from the data. Zero hallucination.\n"
+        "- NEVER mention disconnected or unavailable sources.\n"
+        "- NEVER invent personal context or claim, offer, or suggest actions.\n"
+        "- Acknowledge every source that returned data, even briefly.\n"
+        f"- STRICT LIMIT: {max_words} words. Be concise."
+    )
+    if style != STYLE_TEXT:
+        return (
+            "Produce a concise spoken briefing in decreasing order of importance. "
+            "Cover only the configured sections listed above and only when the "
+            "collected data supports them. Silently omit absent data and sources.\n\n"
+            "Open briefly with the honorific and end after the last supported item. "
+            "Do not add conversational offers or personal asides.\n\n"
+            f"{shared}\n"
+            "- No markdown, emojis, bullets, or headers."
+        )
+    mail = ""
+    if include_messages:
+        mail = (
+            "\nWhen messages contain email or chat items, group those items "
+            "under three headings, still in the persona's language: items that "
+            "need attention or a reply; quieter updates, including deliveries, "
+            "copying tracking numbers exactly as written in the data; and "
+            "promotions plus mail the content itself shows is spam or phishing. "
+            "Omit an empty group. Do not call something spam or phishing unless "
+            "the collected text supports that. Do not invent a tracking number.\n"
+        )
+    return (
+        "Produce a scannable plain-text briefing for a phone screen, in "
+        "decreasing order of importance. Cover only the configured sections "
+        "listed above and only when the collected data supports them. "
+        "Silently omit absent data and sources.\n\n"
+        "Write every word, including headings, in the persona's language. "
+        "These instructions are in English so the layout is unambiguous. "
+        "Do not switch to English unless the persona itself is written in "
+        "English. The English section keys listed above (MESSAGES, CALENDAR, "
+        "and so on) describe what to cover. They are not heading text. Do not "
+        "copy them into the briefing.\n\n"
+        "A persona written for speech may forbid emoji, headings, and "
+        "bullets. Ignore that format ban for this message only. Keep the "
+        "persona's language, tone, and honorific.\n\n"
+        "Do not use Markdown. No asterisks, underscores, hash marks, "
+        "backticks, or bracketed links. Those characters would show up "
+        "literally in the chat. A heading is one short line that starts "
+        "with a single emoji and then words in the persona's language. "
+        "Under it, one short line per item, each starting with a hyphen "
+        "and a space. Do not merge unrelated items into a paragraph.\n"
+        f"{mail}\n"
+        "Open briefly with the honorific and end after the last supported "
+        "item. Do not add conversational offers or personal asides.\n\n"
+        f"{shared}"
+    )
+
+
+def digest_user_suffix(style: str, max_words: int) -> str:
+    """Return the closing instructions for the user message.
+
+    Parameters
+    ----------
+    style:
+        Already normalized style.
+    max_words:
+        Positive word budget.
+
+    Returns
+    -------
+    str
+        Instructions that follow the collected-data block.
+    """
+    shared = (
+        "Use configured sections only. Omit missing data and sources. "
+        "Do not add personal context or activities. "
+        "Use the honorific no more than three times and keep the "
+        f"briefing under {max_words} words."
+    )
+    if style == STYLE_TEXT:
+        return (
+            f"{shared} Use the plain-text layout from the system prompt, "
+            "in the persona's language. No Markdown syntax."
+        )
+    return f"{shared} No markdown, emojis, bullets, or headers."
+
+
+def strip_for_speech(text: str) -> str:
+    """Remove Markdown markers and emoji so speech stays prose.
+
+    Parameters
+    ----------
+    text:
+        Briefing text, possibly with headings or list markers.
+
+    Returns
+    -------
+    str
+        Text safe to send to a speech engine.
+    """
+    cleaned = _MARKDOWN_HEADING.sub("", text or "")
+    cleaned = _LIST_MARKER.sub("", cleaned)
+    cleaned = _EMPHASIS.sub(r"\1", cleaned)
+    cleaned = _EMOJI.sub("", cleaned)
+    return cleaned.strip()
+
+
+def spoken_rewrite_instructions(max_words: int) -> str:
+    """Instructions for turning a text digest into a spoken script.
+
+    The script is for audio only. It may not add facts that are absent
+    from the text briefing, and it stays in that briefing's language.
+
+    Parameters
+    ----------
+    max_words:
+        Positive word budget.
+
+    Returns
+    -------
+    str
+        System prompt for the rewrite call.
+    """
+    return (
+        "Rewrite the briefing below so it can be spoken aloud. "
+        "Use only facts, names, and numbers that already appear in it. "
+        "Do not add items, and do not drop a tracking number that is present. "
+        "Write in the same language as the briefing. Do not translate it. "
+        "No markdown, emojis, bullets, or headers. "
+        f"Stay under {max_words} words. "
+        "Return only the spoken briefing."
+    )
 
 
 @AgentRegistry.register("morning_digest")
@@ -57,23 +323,45 @@ class MorningDigestAgent(ToolUsingAgent):
         self._tts_backend = kwargs.pop("tts_backend", "cartesia")
         self._digest_store_path = kwargs.pop("digest_store_path", "")
         self._honorific = kwargs.pop("honorific", "sir")
+        self._style = normalize_digest_style(kwargs.pop("style", STYLE_SPOKEN))
+        self._max_words = normalize_max_words(
+            kwargs.pop("max_words", DEFAULT_MAX_WORDS)
+        )
         super().__init__(*args, **kwargs)
 
+    def _configured_section_names(self) -> List[str]:
+        """Return configured section names, lower-cased, first-seen order."""
+        return list(
+            dict.fromkeys(
+                str(section).strip().casefold()
+                for section in self._sections
+                if str(section).strip()
+            )
+        )
+
     def _build_system_prompt(self) -> str:
-        """Assemble the system prompt from persona + briefing structure."""
+        """Assemble the system prompt from persona, sections, and style.
+
+        ``style=spoken`` (the default) is a prose script for speech.
+        ``style=text`` is a scannable plain-text message. The persona's
+        language still wins: English layout rules must not pull a Hebrew
+        persona back into English.
+
+        Returns
+        -------
+        str
+            The system prompt for the briefing generation.
+        """
         persona_text = _load_persona(self._persona)
         now = datetime.now()
         honorific = getattr(self, "_honorific", "sir")
-        sections = dict.fromkeys(
-            str(section).strip().casefold()
-            for section in self._sections
-            if str(section).strip()
+        sections = self._configured_section_names()
+        section_block = _section_block(sections)
+        format_block = digest_format_instructions(
+            self._style,
+            self._max_words,
+            include_messages="messages" in sections,
         )
-        section_block = "\n".join(
-            f"- {_SECTION_PROMPTS.get(section, section.upper())}"
-            for section in sections
-        )
-
         return (
             f"{persona_text}\n\n"
             f"Today is {now.strftime('%A, %B %d, %Y')}. "
@@ -82,20 +370,81 @@ class MorningDigestAgent(ToolUsingAgent):
             "You receive structured data from the user's connected services. "
             "The data has ALREADY been collected — it appears in the user "
             "message. You do NOT fetch anything yourself.\n\n"
-            "Produce a concise spoken briefing in decreasing order of importance. "
-            "Cover only the configured sections below and only when the collected "
-            "data supports them. Silently omit absent data and sources.\n\n"
-            f"CONFIGURED SECTIONS:\n{section_block or '- None'}\n\n"
-            "Open briefly with the honorific and end after the last supported item. "
-            "Do not add conversational offers or personal asides.\n\n"
-            "ABSOLUTE RULES (violations are unacceptable):\n"
-            "- ONLY facts from the data. Zero hallucination.\n"
-            "- NEVER mention disconnected or unavailable sources.\n"
-            "- NEVER invent personal context or claim, offer, or suggest actions.\n"
-            "- Acknowledge every source that returned data, even briefly.\n"
-            "- No markdown, emojis, bullets, or headers.\n"
-            "- STRICT LIMIT: 200 words. Be concise."
+            f"CONFIGURED SECTIONS:\n{section_block}\n\n"
+            f"{format_block}"
         )
+
+    def _user_content(self, collected_data: str) -> str:
+        """Wrap collected data with the style-specific closing rules."""
+        return (
+            "The following collected data is the only factual evidence for "
+            f"the briefing:\n\n<collected_data>\n{collected_data}\n"
+            "</collected_data>\n\n"
+            f"{digest_user_suffix(self._style, self._max_words)}"
+        )
+
+    def _tts_text(self, narrative: str) -> str:
+        """Return the text that should be spoken.
+
+        Spoken style is the narrative with Markdown markers removed.
+        Text style is rewritten into speech first. A failed or empty
+        rewrite falls back to the marker-stripped narrative so audio is
+        still produced.
+
+        Parameters
+        ----------
+        narrative:
+            The briefing that will be stored and delivered.
+
+        Returns
+        -------
+        str
+            Text for the speech engine.
+        """
+        if self._style == STYLE_TEXT and narrative.strip():
+            spoken = self._rewrite_for_speech(narrative)
+            if spoken.strip():
+                return strip_for_speech(spoken)
+            logger.warning(
+                "Spoken rewrite for the digest was empty; "
+                "reading the text briefing aloud"
+            )
+        return strip_for_speech(narrative)
+
+    def _rewrite_for_speech(self, narrative: str) -> str:
+        """Rewrite *narrative* into speech without adding facts.
+
+        Exceptions are swallowed. A speech failure must not discard the
+        text briefing that channels will deliver.
+
+        Parameters
+        ----------
+        narrative:
+            The text-style briefing.
+
+        Returns
+        -------
+        str
+            The spoken script, or an empty string when the call fails.
+        """
+        messages = [
+            Message(
+                role=Role.SYSTEM,
+                content=spoken_rewrite_instructions(self._max_words),
+            ),
+            Message(role=Role.USER, content=narrative),
+        ]
+        try:
+            result = self._generate(messages)
+        except Exception as exc:
+            logger.warning(
+                "Spoken rewrite for the digest failed (%s)",
+                type(exc).__name__,
+            )
+            return ""
+        if not isinstance(result, dict):
+            return ""
+        return self._strip_think_tags(str(result.get("content", "") or ""))
 
     def _resolve_sources(self) -> List[str]:
         """Get the list of connector IDs to query."""
@@ -142,17 +491,7 @@ class MorningDigestAgent(ToolUsingAgent):
         system_prompt = self._build_system_prompt()
         messages = [
             Message(role=Role.SYSTEM, content=system_prompt),
-            Message(
-                role=Role.USER,
-                content=(
-                    "The following collected data is the only factual evidence for "
-                    f"the briefing:\n\n<collected_data>\n{collected_data}\n"
-                    "</collected_data>\n\nUse configured sections only. Omit missing "
-                    "data and sources. Do not add personal context or activities. "
-                    "Use the honorific no more than three times and keep the "
-                    "briefing under 200 words."
-                ),
-            ),
+            Message(role=Role.USER, content=self._user_content(collected_data)),
         ]
 
         result = self._generate(messages)
@@ -177,7 +516,10 @@ class MorningDigestAgent(ToolUsingAgent):
                         content=(
                             f"Your briefing scored {quality_score:.1f}/10. "
                             f"Feedback: {evaluator_feedback}\n"
-                            f"Please revise the briefing addressing this feedback."
+                            "Revise the briefing. Keep the same language and the "
+                            "format required above. Stay under "
+                            f"{self._max_words} words. Do not add facts that are "
+                            "not in the collected data."
                         ),
                     )
                 )
@@ -186,14 +528,13 @@ class MorningDigestAgent(ToolUsingAgent):
         except Exception:  # noqa: BLE001
             pass  # Evaluator failure shouldn't block digest delivery
 
-        # Step 3: Generate audio via TTS
-        # Strip any markdown that slipped through (##, *, -, etc.)
-        import re
-
-        tts_text = re.sub(r"^#{1,6}\s+", "", narrative, flags=re.MULTILINE)
-        tts_text = re.sub(r"^\s*[-*•]\s+", "", tts_text, flags=re.MULTILINE)
-        tts_text = re.sub(r"\*{1,2}([^*]+)\*{1,2}", r"\1", tts_text)
-        tts_text = tts_text.strip()
+        # Step 3: Generate audio via TTS.
+        # style=text stores and delivers the scannable message. Speech still
+        # gets a spoken script so it does not read emoji headings aloud.
+        # That script is a rewrite of the message, not a second look at the
+        # raw data, so it cannot introduce facts the text omitted. If the
+        # rewrite fails, the text is read after markers are stripped.
+        tts_text = self._tts_text(narrative)
 
         output_dir = str(get_config_dir() / "digests")
         tts_call = ToolCall(
