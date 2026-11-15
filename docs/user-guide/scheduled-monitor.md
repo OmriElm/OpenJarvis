@@ -190,7 +190,7 @@ The operative agent differs from other agents in that it maintains state across 
 
 ## Troubleshooting
 
-**"Scheduler not running"** -- Start the scheduler daemon with `jarvis scheduler start`. It must be running for scheduled tasks to execute.
+**"Scheduler not running"** -- Scheduled tasks run while `jarvis serve` is up when `[scheduler] enabled` or `[digest] enabled` is true. `jarvis scheduler start` runs the same loop in the foreground and executes due tasks.
 
 **Task doesn't run on time** -- Check that Ollama is running (`ollama serve`). The scheduler triggers the agent, but the agent needs an inference engine. Verify the schedule with `jarvis scheduler status <task-id>`.
 

@@ -114,6 +114,60 @@ class SchedulerStore:
         """Update an existing task (same as save_task — uses INSERT OR REPLACE)."""
         self.save_task(task)
 
+    def claim_due_task(
+        self,
+        task_id: str,
+        expected_next_run: str,
+        *,
+        new_next_run: Optional[str],
+        claimed_at: str,
+        new_status: Optional[str] = None,
+    ) -> bool:
+        """Claim a due slot if it is still active at *expected_next_run*.
+
+        The update is one statement, so two processes sharing this database
+        cannot both win the same slot. The winner's ``next_run`` is already
+        the following slot, which is what stops a restart from running the
+        claimed slot again.
+
+        Parameters
+        ----------
+        task_id:
+            Task to claim.
+        expected_next_run:
+            The ``next_run`` value the caller observed. The claim fails
+            when another writer has already changed it.
+        new_next_run:
+            Slot to store after the claim. ``None`` for a finished
+            one-shot task.
+        claimed_at:
+            ISO-8601 UTC timestamp recorded as ``last_run`` until the
+            execution overwrites it with the finish time.
+        new_status:
+            When set (one-shot tasks use ``"completed"``), the status is
+            updated in the same statement. ``None`` leaves the status
+            unchanged.
+
+        Returns
+        -------
+        bool
+            True when this caller owns the slot.
+        """
+        if new_status is None:
+            cursor = self._conn.execute(
+                "UPDATE scheduled_tasks SET next_run = ?, last_run = ? "
+                "WHERE id = ? AND status = 'active' AND next_run = ?",
+                (new_next_run, claimed_at, task_id, expected_next_run),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE scheduled_tasks SET next_run = ?, last_run = ?, status = ? "
+                "WHERE id = ? AND status = 'active' AND next_run = ?",
+                (new_next_run, claimed_at, new_status, task_id, expected_next_run),
+            )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
     def delete_task(self, task_id: str) -> None:
         """Delete a task by ID."""
         self._conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))

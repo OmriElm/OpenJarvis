@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
@@ -98,10 +99,16 @@ class TestDigestScheduleCLI:
 
     def test_scheduler_task_persists_digest_timezone(self, tmp_path):
         from openjarvis.cli import digest_cmd
+        from openjarvis.core.config import SchedulerConfig
         from openjarvis.scheduler.store import SchedulerStore
 
         config_path = tmp_path / "config.toml"
-        with patch("openjarvis.cli.digest_cmd.DEFAULT_CONFIG_PATH", config_path):
+        mock_cfg = MagicMock()
+        mock_cfg.scheduler = SchedulerConfig(db_path="")
+        with (
+            patch("openjarvis.cli.digest_cmd.DEFAULT_CONFIG_PATH", config_path),
+            patch("openjarvis.cli.digest_cmd.load_config", return_value=mock_cfg),
+        ):
             task_id = digest_cmd._create_scheduler_task(
                 "0 6 * * *",
                 "America/Los_Angeles",
@@ -113,7 +120,8 @@ class TestDigestScheduleCLI:
         store.close()
 
         assert task is not None
-        assert task["metadata"] == {"timezone": "America/Los_Angeles"}
+        assert task["metadata"]["timezone"] == "America/Los_Angeles"
+        assert task["metadata"]["managed_by"] == "digest"
         next_run = datetime.fromisoformat(task["next_run"])
         local_next_run = next_run.astimezone(ZoneInfo("America/Los_Angeles"))
         assert (local_next_run.hour, local_next_run.minute) == (6, 0)
@@ -219,3 +227,50 @@ class TestDigestScheduleEndpoints:
         assert data["cron"] == "0 6 * * *"
         mock_save.assert_called_once_with(enabled=False, cron="0 6 * * *")
         mock_cancel.assert_called_once()
+
+
+def test_save_schedule_round_trips_utf8(tmp_path: Path, monkeypatch) -> None:
+    """Non-ASCII config must survive on a cp1252 locale (Windows default)."""
+    from openjarvis.cli.digest_cmd import _save_digest_schedule
+
+    config_path = tmp_path / "config.toml"
+    original = (
+        "# בוקר טוב\n"
+        "[digest]\n"
+        "enabled = false\n"
+        'schedule = "0 6 * * *"\n'
+        'deliver_to = ["telegram:42"]\n'
+        'timezone = "Asia/Jerusalem"\n'
+    )
+    config_path.write_bytes(original.encode("utf-8"))
+
+    real_read = Path.read_text
+    real_write = Path.write_text
+
+    def read_text(path, encoding=None, errors=None, newline=None):
+        return real_read(path, encoding=encoding or "cp1252", errors=errors)
+
+    def write_text(path, data, encoding=None, errors=None, newline=None):
+        return real_write(
+            path,
+            data,
+            encoding=encoding or "cp1252",
+            errors=errors,
+            newline=newline,
+        )
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "write_text", write_text)
+    monkeypatch.setattr(
+        "openjarvis.cli.digest_cmd.DEFAULT_CONFIG_PATH",
+        config_path,
+    )
+
+    _save_digest_schedule(True, "30 7 * * 1-5")
+
+    text = config_path.read_bytes().decode("utf-8")
+    assert text.startswith("# בוקר טוב\n")
+    assert "enabled = true" in text
+    assert 'schedule = "30 7 * * 1-5"' in text
+    assert 'deliver_to = ["telegram:42"]' in text
+    assert 'timezone = "Asia/Jerusalem"' in text

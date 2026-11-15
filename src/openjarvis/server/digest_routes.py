@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -17,6 +18,8 @@ from openjarvis.cli.digest_cmd import (
 )
 from openjarvis.core.config import load_config
 
+logger = logging.getLogger(__name__)
+
 
 class ScheduleUpdate(BaseModel):
     """Request body for updating the digest schedule."""
@@ -27,10 +30,18 @@ class ScheduleUpdate(BaseModel):
 
 def _generate_digest_sync() -> str:
     """Generate a digest with the whole Jarvis lifecycle on one worker."""
+    from openjarvis.agents.digest_delivery import deliver_digest_text
     from openjarvis.sdk import Jarvis
 
     with Jarvis() as jarvis:
-        return jarvis.ask("Generate my morning digest", agent="morning_digest")
+        text = jarvis.ask("Generate my morning digest", agent="morning_digest")
+    if not isinstance(text, str):
+        text = str(text)
+    try:
+        deliver_digest_text(text, load_config())
+    except Exception as exc:
+        logger.warning("Digest delivery failed (%s)", type(exc).__name__)
+    return text
 
 
 def create_digest_router(*, db_path: str = "") -> APIRouter:

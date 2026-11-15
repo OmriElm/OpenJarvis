@@ -128,6 +128,51 @@ jarvis digest --schedule off   # Disable schedule
 jarvis digest --schedule       # Show current schedule
 ```
 
+## Running on a schedule
+
+`jarvis digest --schedule` saves the cron expression and a task in the scheduler database. Nothing polls that database on its own. While `jarvis serve` is running (the process the Windows service, systemd unit, and launchd agent keep up), an enabled digest fires at the configured local time. You do not need cron, Task Scheduler, or a separate script.
+
+```toml
+[digest]
+enabled = true
+schedule = "0 7 * * *"          # 07:00 in the timezone below
+timezone = "Asia/Jerusalem"     # IANA name; not the host's local zone
+
+[scheduler]
+# Also starts every other scheduled task, not only the digest.
+# The digest runs when [digest] enabled is true even if this stays false.
+enabled = true
+poll_interval = 60
+# Run a missed slot once if the machine was off for at most this many
+# seconds. Older misses are skipped and the next future slot is stored.
+# 0 means always run one missed execution, however late it is.
+misfire_grace_seconds = 7200
+```
+
+The schedule is evaluated in `digest.timezone` and stored as UTC. An unknown timezone is logged once and treated as UTC.
+
+Missed runs are at most once. If the process was down at 07:00 and comes back within the grace window, the digest runs once on startup. If it comes back later than that, the missed briefing is skipped and the next day is scheduled. The slot is claimed in the scheduler database before generation starts, so a restart during or after a run does not send a second briefing for the same slot. A crash after the claim and before delivery loses that slot rather than sending it twice.
+
+`jarvis scheduler start` does the same work in the foreground. It builds a real Jarvis system and executes due tasks. If the system cannot be built it exits and says that no tasks were executed; it does not sit in a loop pretending to run them.
+
+## Delivering to a channel
+
+Set `deliver_to` to push the generated text. Each entry is `channel:destination`. Telegram is supported. The bot token is read from `[channel.telegram] bot_token` or the `TELEGRAM_BOT_TOKEN` environment variable and is never written to logs. Messages longer than Telegram's 4096-character limit are split, and the text is sent as plain text so Hebrew and Markdown characters are preserved.
+
+```toml
+[digest]
+deliver_to = ["telegram:123456789"]
+
+[channel.telegram]
+bot_token = ""                  # or export TELEGRAM_BOT_TOKEN
+# allowed_chat_ids gates incoming chat, not this outbound delivery.
+allowed_chat_ids = "123456789"
+```
+
+Delivery runs when a scheduled digest succeeds, after `jarvis digest --fresh`, after `jarvis scheduler run-task morning_digest`, and after `POST /api/digest/generate`. An empty `deliver_to` leaves the digest on disk only. A network failure is logged and does not fail generation.
+
+Find the chat id by messaging the bot, then reading `jarvis channel` logs, or from Telegram's `getUpdates` while the bot is not already polling.
+
 ## Saying "Good morning"
 
 When chatting with Jarvis (via CLI, desktop, or browser), saying "Good morning" or "morning digest" automatically triggers the digest — no need to use the `digest` command explicitly.

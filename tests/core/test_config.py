@@ -479,6 +479,7 @@ class TestSchedulerConfig:
         assert sc.enabled is False
         assert sc.poll_interval == 60
         assert sc.db_path == ""
+        assert sc.misfire_grace_seconds == 7200
 
     def test_custom_values(self) -> None:
         sc = SchedulerConfig(enabled=True, poll_interval=30, db_path="/tmp/sched.db")
@@ -501,6 +502,30 @@ class TestSchedulerConfig:
         assert cfg.scheduler.enabled is True
         assert cfg.scheduler.poll_interval == 30
         assert cfg.scheduler.db_path == "/tmp/sched.db"
+
+    def test_digest_delivery_and_misfire_grace_load_from_toml(
+        self, tmp_path: Path
+    ) -> None:
+        toml_file = tmp_path / "config.toml"
+        toml_file.write_text(
+            "[digest]\n"
+            "enabled = true\n"
+            'schedule = "30 7 * * *"\n'
+            'timezone = "Asia/Jerusalem"\n'
+            'deliver_to = ["telegram:123", "telegram:-1005"]\n'
+            "\n"
+            "[scheduler]\n"
+            "enabled = true\n"
+            "misfire_grace_seconds = 900\n",
+            encoding="utf-8",
+        )
+        cfg = load_config(toml_file)
+        assert cfg.digest.enabled is True
+        assert cfg.digest.schedule == "30 7 * * *"
+        assert cfg.digest.timezone == "Asia/Jerusalem"
+        assert cfg.digest.deliver_to == ["telegram:123", "telegram:-1005"]
+        assert cfg.scheduler.enabled is True
+        assert cfg.scheduler.misfire_grace_seconds == 900
 
 
 # ---------------------------------------------------------------------------
