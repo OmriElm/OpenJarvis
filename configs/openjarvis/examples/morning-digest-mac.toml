@@ -24,8 +24,11 @@ enabled = ["code_interpreter", "web_search", "file_read", "shell_exec", "digest_
 
 [digest]
 enabled = true
-schedule = "0 7 * * *"             # 7 AM daily
-timezone = "America/Los_Angeles"   # Change to your timezone
+schedule = "0 7 * * *"             # 7 AM daily, in timezone below
+timezone = "America/Los_Angeles"   # IANA name, e.g. "Asia/Jerusalem"
+# style = "text"                       # scannable chat layout; speech stays spoken
+# max_words = 350
+# deliver_to = ["telegram:123456789"]
 persona = "jarvis"
 honorific = "sir"                  # "sir", "ma'am", "boss", or any custom
 tts_backend = "cartesia"           # "cartesia" or "openai"
@@ -41,7 +44,9 @@ sources = ["oura"]                 # Add "apple_health" if you export from iPhon
 
 [digest.messages]
 sources = ["gmail", "google_tasks", "imessage"]
-# Add any of: "slack", "notion", "github_notifications"
+# Add any of: "slack", "notion", "github_notifications", "gmail_imap"
+# unread_only = true
+# unread_hours_back = 168     # 7 days of unread mail; 0 = no date cutoff
 
 [digest.calendar]
 sources = ["gcalendar"]

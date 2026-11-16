@@ -713,6 +713,52 @@ def serve(
         except Exception as exc:
             logger.debug("Agent scheduler init failed: %s", exc)
 
+    # Persisted cron/interval tasks, including the morning digest. This is
+    # separate from the managed-agent scheduler above: digest jobs live in
+    # scheduler.db and previously never ran while `jarvis serve` was up.
+    task_scheduler = None
+    task_scheduler_store = None
+    if config.scheduler.enabled or config.digest.enabled:
+        try:
+            from openjarvis.scheduler.service import start_background_scheduler
+            from openjarvis.system import JarvisSystem
+
+            sched_system = JarvisSystem(
+                config=config,
+                bus=bus,
+                engine=engine,
+                engine_key=engine_name,
+                model=model_name,
+                agent=agent,
+                agent_name=agent_key or "",
+                tools=resolved_tools,
+                memory_backend=memory_backend,
+                telemetry_store=telem_store,
+                capability_policy=sec.capability_policy,
+                audit_logger=sec.audit_logger,
+                rate_limiter=sec.rate_limiter,
+            )
+            started = start_background_scheduler(config, sched_system, bus=bus)
+            if started is not None:
+                task_scheduler, task_scheduler_store = started
+                console.print("  Schedule: [cyan]active[/cyan]")
+        except Exception as exc:
+            # Startup failures here are sqlite or config errors, not channel
+            # tokens. Keep the text short so a huge SQL dump cannot flood
+            # the log.
+            detail = str(exc).replace("\n", " ")
+            if len(detail) > 200:
+                detail = detail[:197] + "..."
+            logger.warning(
+                "Task scheduler failed to start (%s): %s",
+                type(exc).__name__,
+                detail,
+            )
+            console.print(
+                "[yellow]Scheduled tasks will not run "
+                f"({type(exc).__name__}: {detail}).[/yellow]"
+            )
+
     # --- Channel Gateway: API key, sessions, ChannelBridge ---
     import os as _os
 
@@ -799,6 +845,8 @@ def serve(
         webhook_config=webhook_config,
         cors_origins=cors_origins,
     )
+    app.state.task_scheduler = task_scheduler
+    app.state.task_scheduler_store = task_scheduler_store
 
     console.print(
         f"[green]Starting OpenJarvis API server[/green]\n"

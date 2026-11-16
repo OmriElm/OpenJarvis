@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import signal
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 import click
 from rich.console import Console
 from rich.table import Table
+
+logger = logging.getLogger(__name__)
 
 
 def _get_store() -> "SchedulerStore":  # noqa: F821
@@ -288,11 +291,75 @@ def scheduler_run_task(agent_name: str, dry_run: bool) -> None:
         console.print("[green]Done.[/green]")
         if result:
             console.print(result)
+        if match.agent == "morning_digest":
+            from openjarvis.agents.digest_delivery import deliver_digest_text
+            from openjarvis.scheduler.scheduler import coerce_ask_result
+
+            try:
+                report = deliver_digest_text(coerce_ask_result(result), load_config())
+            except Exception as exc:
+                console.print(
+                    f"[yellow]Digest delivery failed ({type(exc).__name__}).[/yellow]"
+                )
+            else:
+                if report.failed:
+                    console.print(
+                        "[yellow]Digest ran, but "
+                        f"{report.failed} channel delivery(ies) failed.[/yellow]"
+                    )
+                elif report.sent:
+                    console.print(
+                        f"[green]Delivered the digest to {report.sent} "
+                        "channel(s).[/green]"
+                    )
     except Exception as exc:
         console.print(f"[red]Error: {exc}[/red]")
         raise SystemExit(1)
     finally:
         store.close()
+
+
+def _build_scheduler_system(config: Any) -> Any:
+    """Build a Jarvis system that can execute scheduled tasks.
+
+    Raises
+    ------
+    click.ClickException
+        When the engine or another startup dependency is unavailable.
+        The command stops instead of polling in dry-run mode.
+    """
+    from openjarvis.system import SystemBuilder
+
+    try:
+        return SystemBuilder(config).build()
+    except click.ClickException:
+        raise
+    except Exception as exc:
+        raise click.ClickException(
+            "Scheduler did not start because the Jarvis system failed to "
+            f"initialize ({type(exc).__name__}: {exc}). "
+            "No tasks were executed. Fix the engine configuration, or run "
+            "`jarvis serve` once an engine is available."
+        ) from exc
+
+
+def _block_until_signal(sched: Any, console: Console) -> None:
+    """Block until SIGINT or SIGTERM. Windows has no ``signal.pause``."""
+
+    def _handle_signal(signum: int, frame: object) -> None:
+        sched.stop()
+        console.print("\n[yellow]Scheduler stopped.[/yellow]")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    try:
+        signal.pause()
+    except AttributeError:
+        import time
+
+        while True:
+            time.sleep(1)
 
 
 @scheduler.command("start")
@@ -303,34 +370,66 @@ def scheduler_run_task(agent_name: str, dry_run: bool) -> None:
     help="Seconds between poll cycles.",
 )
 def scheduler_start(poll_interval: int) -> None:
-    """Start the scheduler daemon (foreground)."""
+    """Start the scheduler and execute due tasks until interrupted.
+
+    Tasks are sent to the configured agent. A missed run fires once on
+    startup when it is still inside ``scheduler.misfire_grace_seconds``
+    (default two hours); older misses are skipped. The slot is claimed
+    before it runs, so restarting this process does not run it twice.
+
+    This is not a dry run. Use ``jarvis scheduler run-task --dry-run`` to
+    preview one task without executing it.
+    """
     console = Console()
-    store = _get_store()
-
+    from openjarvis.agents.digest_delivery import deliver_scheduled_result
+    from openjarvis.core.config import load_config
+    from openjarvis.scheduler.digest_sync import sync_digest_task
     from openjarvis.scheduler.scheduler import TaskScheduler
+    from openjarvis.scheduler.service import coerce_grace_seconds, coerce_poll_interval
 
-    sched = TaskScheduler(store, poll_interval=poll_interval)
-    sched.start()
-    console.print(
-        f"[green]Scheduler running (poll every {poll_interval}s). "
-        "Press Ctrl+C to stop.[/green]"
-    )
-
-    def _handle_signal(signum: int, frame: object) -> None:
-        sched.stop()
-        store.close()
-        console.print("\n[yellow]Scheduler stopped.[/yellow]")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
-    # Block main thread until the daemon thread dies
+    config = load_config()
+    interval = coerce_poll_interval(poll_interval)
+    store = _get_store()
+    system = None
+    sched = None
     try:
-        signal.pause()
-    except AttributeError:
-        # signal.pause() not available on Windows
-        import time
-
-        while True:
-            time.sleep(1)
+        system = _build_scheduler_system(config)
+        sched = TaskScheduler(
+            store,
+            system,
+            poll_interval=interval,
+            misfire_grace_seconds=coerce_grace_seconds(
+                config.scheduler.misfire_grace_seconds
+            ),
+            on_success=lambda task, text, _cfg=config: deliver_scheduled_result(
+                task, text, _cfg
+            ),
+        )
+        try:
+            sync_digest_task(sched, config.digest, respect_pause=True)
+        except Exception as exc:
+            logger.warning(
+                "Could not sync the digest schedule (%s)",
+                type(exc).__name__,
+            )
+        sched.start()
+        console.print(
+            f"[green]Scheduler running[/green] (poll every {interval}s). "
+            "Due tasks will be executed. Press Ctrl+C to stop."
+        )
+        try:
+            _block_until_signal(sched, console)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Scheduler stopped.[/yellow]")
+    finally:
+        if sched is not None:
+            sched.stop()
+        store.close()
+        if system is not None and hasattr(system, "close"):
+            try:
+                system.close()
+            except Exception as exc:
+                logger.warning(
+                    "Scheduler system shutdown failed (%s)",
+                    type(exc).__name__,
+                )

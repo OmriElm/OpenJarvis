@@ -51,8 +51,9 @@ class OutlookConnector(GmailIMAPConnector):
         *,
         since: Optional[datetime] = None,
         cursor: Optional[str] = None,
+        unread_only: bool = False,
     ) -> Iterator[Document]:
-        for doc in super().sync(since=since, cursor=cursor):
+        for doc in super().sync(since=since, cursor=cursor, unread_only=unread_only):
             doc.source = "outlook"
             doc.doc_id = doc.doc_id.replace("gmail:", "outlook:", 1)
             yield doc

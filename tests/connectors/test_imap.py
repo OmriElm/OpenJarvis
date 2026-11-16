@@ -363,6 +363,49 @@ def test_implicit_tls_uses_checked_ip_and_original_hostname() -> None:
     )
 
 
+def test_unread_sync_searches_unseen_and_does_not_mark_read(tmp_path: Path) -> None:
+    """UNSEEN is server-side, and BODY.PEEK[] must not set \\Seen."""
+    from datetime import datetime, timezone
+
+    from openjarvis.connectors.gmail_imap import imap_search_terms
+
+    since = datetime(2026, 11, 9, 8, 0, tzinfo=timezone.utc)
+    assert imap_search_terms(unread_only=True, since=since) == [
+        "UNSEEN",
+        "SINCE",
+        "09-Nov-2026",
+    ]
+    assert imap_search_terms() == ["ALL"]
+
+    conn = IMAPConnector(
+        email_address="user@example.org",
+        app_password="secret",
+        credentials_path=str(tmp_path / "imap.json"),
+    )
+    client = _sync_client()
+
+    def uid(command: str, *args):
+        if command == "SEARCH":
+            assert args == (None, "UNSEEN", "SINCE", "09-Nov-2026")
+            return "OK", [b"41"]
+        if command == "FETCH":
+            assert args == (b"41", "(BODY.PEEK[])")
+            return "OK", [(b"41 (BODY[] {1})", _message())]
+        raise AssertionError(f"Unexpected UID command: {command} {args}")
+
+    client.uid.side_effect = uid
+    with patch.object(conn, "_make_imap_client", return_value=client):
+        docs = list(conn.sync(since=since, unread_only=True))
+
+    assert len(docs) == 1
+    assert docs[0].title == "Test Email"
+    client.select.assert_called_once_with("INBOX", readonly=True)
+    flat = " ".join(str(part) for call in client.mock_calls for part in call.args)
+    assert "STORE" not in flat
+    assert "\\Seen" not in flat
+    client.store.assert_not_called()
+
+
 def test_sync_uses_uids_and_generic_document_identity(tmp_path: Path) -> None:
     conn = IMAPConnector(
         email_address="user@example.org",

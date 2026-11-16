@@ -270,6 +270,22 @@ class TestSend:
             # not also be used as a self-referential reply id.
             assert "reply_to_message_id" not in payload
 
+    def test_send_splits_over_telegram_limit(self):
+        from openjarvis.channels.splitting import utf16_len
+
+        ch = TelegramChannel(bot_token="123:ABC")
+        text = "ש" * 5000
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        with patch("httpx.post", return_value=mock_response) as mock_post:
+            assert ch.send("12345678", text) is True
+
+        bodies = [call.kwargs["json"]["text"] for call in mock_post.call_args_list]
+        assert len(bodies) >= 2
+        assert "".join(bodies) == text
+        assert all(utf16_len(part) <= 4096 for part in bodies)
+
 
 class TestStatus:
     def test_no_token_connect_error(self):

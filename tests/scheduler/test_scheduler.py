@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -340,19 +340,238 @@ class TestLifecycle:
         assert scheduler._thread is t1
         scheduler.stop()
 
-    def test_poll_loop_finds_due_tasks(self, store):
-        sched = TaskScheduler(store, poll_interval=1)
-        # Create a task that is already due
-        task = sched.create_task("immediate", "once", "2020-01-01T00:00:00+00:00")
-        # Manually set next_run to the past
-        d = store.get_task(task.id)
-        d["next_run"] = "2020-01-01T00:00:00+00:00"
-        store.update_task(d)
+    def test_poll_loop_invokes_poll_once(self, store, monkeypatch):
+        sched = TaskScheduler(store, poll_interval=60)
+        calls = {"n": 0}
 
-        sched.start()
-        # Give the poll loop time to execute
-        time.sleep(2.5)
-        sched.stop()
+        def _once() -> list[str]:
+            calls["n"] += 1
+            sched._stop_event.set()
+            return []
 
+        monkeypatch.setattr(sched, "poll_once", _once)
+        sched._poll_loop()
+        assert calls["n"] == 1
+
+
+# -- Due slots, grace, and timezones ------------------------------------------
+
+
+def _utc(year: int, month: int, day: int, hour: int, minute: int = 0, second: int = 0):
+    return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+
+
+class TestDueSlots:
+    def test_poll_once_runs_a_recent_miss_and_does_not_repeat(self, store):
+        now = _utc(2026, 6, 1, 12, 0)
+        system = MagicMock()
+        system.ask.return_value = {"content": "result text"}
+        sched = TaskScheduler(
+            store,
+            system,
+            clock=lambda: now,
+            misfire_grace_seconds=7200,
+        )
+        task = sched.create_task("immediate", "once", "2026-06-01T11:30:00+00:00")
+
+        assert sched.poll_once() == [task.id]
+        system.ask.assert_called_once()
         logs = store.get_run_logs(task.id)
-        assert len(logs) >= 1
+        assert logs[0]["success"] == 1
+        assert logs[0]["result"] == "result text"
+        assert sched.poll_once() == []
+        assert system.ask.call_count == 1
+
+    def test_outside_grace_skips_without_executing(self, store):
+        now = _utc(2026, 6, 1, 12, 0)
+        system = MagicMock()
+        system.ask.return_value = "should not run"
+        sched = TaskScheduler(
+            store,
+            system,
+            clock=lambda: now,
+            misfire_grace_seconds=3600,
+        )
+        task = sched.create_task("late", "once", "2026-06-01T09:00:00+00:00")
+
+        assert sched.poll_once() == [task.id]
+        system.ask.assert_not_called()
+        updated = store.get_task(task.id)
+        assert updated["status"] == "completed"
+        assert updated["next_run"] is None
+        logs = store.get_run_logs(task.id)
+        assert logs[0]["success"] == 0
+        assert "misfire grace" in logs[0]["error"]
+
+    def test_grace_boundary_is_inclusive(self, tmp_path):
+        scheduled = _utc(2026, 4, 1, 6, 0)
+        grace = 3600
+
+        def run_at(moment: datetime) -> bool:
+            db = SchedulerStore(tmp_path / f"{int(moment.timestamp())}.db")
+            system = MagicMock()
+            system.ask.return_value = "ok"
+            sched = TaskScheduler(
+                db,
+                system,
+                clock=lambda: moment,
+                misfire_grace_seconds=grace,
+            )
+            sched.create_task("boundary", "once", scheduled.isoformat())
+            sched.poll_once()
+            called = system.ask.called
+            db.close()
+            return called
+
+        assert run_at(scheduled + timedelta(seconds=grace)) is True
+        assert run_at(scheduled + timedelta(seconds=grace + 1)) is False
+
+    def test_slow_interval_is_not_due_again_immediately(self, store):
+        start = _utc(2026, 6, 1, 12, 0)
+        clock = {"now": start}
+        system = MagicMock()
+
+        def _ask(*_args, **_kwargs):
+            clock["now"] = start + timedelta(seconds=90)
+            return "done"
+
+        system.ask.side_effect = _ask
+        sched = TaskScheduler(
+            store,
+            system,
+            clock=lambda: clock["now"],
+            misfire_grace_seconds=7200,
+        )
+        task = sched.create_task("tick", "interval", "60")
+        row = store.get_task(task.id)
+        assert row is not None
+        row["next_run"] = start.isoformat()
+        store.update_task(row)
+
+        assert sched.poll_once() == [task.id]
+        updated = store.get_task(task.id)
+        assert updated is not None
+        assert datetime.fromisoformat(updated["next_run"]) == start + timedelta(
+            seconds=150
+        )
+        assert sched.poll_once() == []
+
+    def test_zero_grace_runs_however_late(self, store):
+        now = _utc(2026, 6, 1, 12, 0)
+        system = MagicMock()
+        system.ask.return_value = "caught up"
+        sched = TaskScheduler(
+            store,
+            system,
+            clock=lambda: now,
+            misfire_grace_seconds=0,
+        )
+        task = sched.create_task("ancient", "once", "2020-01-01T00:00:00+00:00")
+        assert sched.poll_once() == [task.id]
+        system.ask.assert_called_once()
+
+    def test_claim_is_exclusive_across_connections(self, tmp_path):
+        path = tmp_path / "scheduler.db"
+        store_a = SchedulerStore(path)
+        store_b = SchedulerStore(path)
+        now = _utc(2026, 3, 1, 12, 0)
+        sched = TaskScheduler(store_a, clock=lambda: now)
+        task = sched.create_task("p", "once", "2026-03-01T11:00:00+00:00")
+
+        first = store_a.claim_due_task(
+            task.id,
+            task.next_run or "",
+            new_next_run=None,
+            claimed_at=now.isoformat(),
+            new_status="completed",
+        )
+        second = store_b.claim_due_task(
+            task.id,
+            task.next_run or "",
+            new_next_run=None,
+            claimed_at=now.isoformat(),
+            new_status="completed",
+        )
+
+        assert first is True
+        assert second is False
+        store_a.close()
+        store_b.close()
+
+    def test_dry_run_does_not_invoke_success_callback(self, store):
+        called: list[str] = []
+        sched = TaskScheduler(
+            store,
+            on_success=lambda _task, text: called.append(text),
+        )
+        task = sched.create_task("dry", "once", "2020-01-01T00:00:00+00:00")
+        sched._execute_task(task)
+        assert called == []
+
+    @pytest.mark.parametrize(
+        "local_fire",
+        [
+            datetime(2026, 1, 15, 8, 0, tzinfo=ZoneInfo("Asia/Jerusalem")),
+            datetime(2026, 7, 15, 8, 0, tzinfo=ZoneInfo("Asia/Jerusalem")),
+        ],
+    )
+    def test_cron_fires_in_configured_timezone(self, store, local_fire):
+        before = (local_fire - timedelta(minutes=1)).astimezone(timezone.utc)
+        due = (local_fire + timedelta(seconds=5)).astimezone(timezone.utc)
+        clock = {"now": before}
+        system = MagicMock()
+        system.ask.return_value = {"content": "בוקר טוב"}
+        sched = TaskScheduler(
+            store,
+            system,
+            clock=lambda: clock["now"],
+            misfire_grace_seconds=7200,
+        )
+        task = sched.create_task(
+            "Generate my morning digest",
+            "cron",
+            "0 8 * * *",
+            agent="morning_digest",
+            metadata={"timezone": "Asia/Jerusalem"},
+        )
+        assert datetime.fromisoformat(task.next_run) == local_fire.astimezone(
+            timezone.utc
+        )
+
+        clock["now"] = due
+        delivered: dict[str, str] = {}
+        sched.set_on_success(lambda _task, text: delivered.setdefault("text", text))
+        assert sched.poll_once() == [task.id]
+        system.ask.assert_called_once()
+        assert delivered["text"] == "בוקר טוב"
+
+        # The slot was claimed. A restart at the same clock must not fire again.
+        assert sched.poll_once() == []
+        assert system.ask.call_count == 1
+        updated = store.get_task(task.id)
+        next_local = datetime.fromisoformat(updated["next_run"]).astimezone(
+            ZoneInfo("Asia/Jerusalem")
+        )
+        assert (next_local.hour, next_local.minute) == (8, 0)
+        assert next_local.date() == (local_fire + timedelta(days=1)).date()
+
+    def test_invalid_timezone_is_utc_and_logged_once(self, store, caplog):
+        fixed = _utc(2026, 1, 15, 12, 0)
+        sched = TaskScheduler(store, clock=lambda: fixed)
+        bad_name = "Not/ARealZone"
+        with caplog.at_level("ERROR"):
+            bad = sched.create_task(
+                "p",
+                "cron",
+                "0 8 * * *",
+                metadata={"timezone": bad_name},
+            )
+            good = sched.create_task(
+                "p",
+                "cron",
+                "0 8 * * *",
+                metadata={"timezone": "UTC"},
+            )
+        assert bad.next_run == good.next_run
+        assert bad_name in caplog.text
+        assert "UTC" in caplog.text

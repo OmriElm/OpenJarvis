@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import textwrap
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -162,31 +161,28 @@ class TelegramChannel(BaseChannel):
             logger.warning("Cannot send: no Telegram bot token")
             return False
 
+        # Canonical channel send contract (see BaseChannel.send): the first
+        # positional ``channel`` arg is the DESTINATION (the Telegram chat
+        # id).  ``conversation_id`` is the inbound message id used as a
+        # reply/thread reference (``reply_to_message_id``).  We fall back to
+        # ``conversation_id`` as the chat id only when ``channel`` is empty,
+        # for backwards compatibility with legacy callers that passed the
+        # chat id via ``conversation_id``.
+        chat_id = channel or conversation_id
+        reply_to = conversation_id if (channel and conversation_id) else ""
         try:
             import httpx
 
-            _TELEGRAM_MAX_LEN = 4096
-            url = f"https://api.telegram.org/bot{self._token}/sendMessage"
-            # Canonical channel send contract (see BaseChannel.send): the first
-            # positional ``channel`` arg is the DESTINATION (the Telegram chat
-            # id).  ``conversation_id`` is the inbound message id used as a
-            # reply/thread reference (``reply_to_message_id``).  We fall back to
-            # ``conversation_id`` as the chat id only when ``channel`` is empty,
-            # for backwards compatibility with legacy callers that passed the
-            # chat id via ``conversation_id``.
-            chat_id = channel or conversation_id
-            reply_to = conversation_id if (channel and conversation_id) else ""
-            chunks = textwrap.wrap(
-                content,
-                width=_TELEGRAM_MAX_LEN,
-                break_long_words=True,
-                replace_whitespace=False,
+            from openjarvis.channels.splitting import (
+                TELEGRAM_TEXT_LIMIT,
+                split_message,
             )
+
+            url = f"https://api.telegram.org/bot{self._token}/sendMessage"
+            chunks = split_message(content, TELEGRAM_TEXT_LIMIT)
             if not chunks:
-                # Empty content wraps to an empty chunk list -- there is
-                # nothing to send, so this must not fall through to the
-                # success path below and report a message that was never
-                # transmitted (#783).
+                # Empty content produces no chunks. Do not report a message
+                # that was never transmitted (#783).
                 return False
             for chunk in chunks:
                 payload: Dict[str, Any] = {
@@ -202,14 +198,15 @@ class TelegramChannel(BaseChannel):
                 if resp.status_code >= 300:
                     # Telegram rejects unparseable Markdown (lone asterisks,
                     # unclosed code fences, unescaped snake_case
-                    # identifiers, etc.) with a 400 naming the cause in the
-                    # response body. Retry once as plain text instead of
-                    # dropping the message outright (#783).
+                    # identifiers, etc.) with a 400. Retry once as plain
+                    # text instead of dropping the message (#783). The
+                    # response body is not logged: it can echo the request
+                    # URL, which contains the bot token.
                     if self._parse_mode and "can't parse entities" in resp.text.lower():
                         logger.warning(
-                            "Telegram rejected Markdown formatting, "
-                            "retrying as plain text: %s",
-                            resp.text,
+                            "Telegram rejected Markdown formatting for chat %s; "
+                            "retrying as plain text",
+                            chat_id,
                         )
                         plain_payload = {
                             k: v for k, v in payload.items() if k != "parse_mode"
@@ -217,15 +214,21 @@ class TelegramChannel(BaseChannel):
                         resp = httpx.post(url, json=plain_payload, timeout=10.0)
                     if resp.status_code >= 300:
                         logger.warning(
-                            "Telegram API returned status %d: %s",
+                            "Telegram API returned status %d for chat %s",
                             resp.status_code,
-                            resp.text,
+                            chat_id,
                         )
                         return False
             self._publish_sent(channel, content, conversation_id)
             return True
-        except Exception:
-            logger.debug("Telegram send failed", exc_info=True)
+        except Exception as exc:
+            # Do not log the exception text or traceback. httpx includes
+            # the request URL, and that URL contains the bot token.
+            logger.warning(
+                "Telegram send to chat %s failed (%s)",
+                chat_id,
+                type(exc).__name__,
+            )
             return False
 
     def status(self) -> ChannelStatus:

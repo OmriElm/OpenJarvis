@@ -362,6 +362,19 @@ class SystemBuilder:
         )
         system._learning_orchestrator = learning_orchestrator
         system._skill_few_shot_examples = skill_few_shot_examples
+        if task_scheduler is not None:
+            # The scheduler is built before the system exists. Attach it so
+            # a later start() executes tasks instead of dry-running. serve
+            # and `jarvis scheduler start` own the thread; build() does not
+            # start one, because one-shot commands also call build().
+            task_scheduler.set_system(system)
+            from openjarvis.agents.digest_delivery import deliver_scheduled_result
+
+            task_scheduler.set_on_success(
+                lambda task, text, _cfg=config: deliver_scheduled_result(
+                    task, text, _cfg
+                )
+            )
         system._mcp_clients = list(getattr(self, "_mcp_clients", []))
         if system.agent_executor is not None:
             system.agent_executor.set_system(system)
@@ -600,10 +613,16 @@ class SystemBuilder:
 
             from openjarvis.scheduler.scheduler import TaskScheduler
 
+            raw_grace = getattr(config.scheduler, "misfire_grace_seconds", 7200)
+            try:
+                grace_seconds = int(raw_grace)
+            except (TypeError, ValueError):
+                grace_seconds = 7200
             sched = TaskScheduler(
                 store,
                 poll_interval=config.scheduler.poll_interval,
                 bus=bus,
+                misfire_grace_seconds=grace_seconds,
             )
             return store, sched
         except Exception as exc:

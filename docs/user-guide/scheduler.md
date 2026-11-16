@@ -2,8 +2,8 @@
 
 The task scheduler lets you run agent queries automatically on a schedule -- once at a future time, on a recurring interval, or via a cron expression. Scheduled tasks are persisted in SQLite so they survive process restarts, and execution is handled by a background daemon thread that polls for due tasks every 60 seconds.
 
-!!! note "Optional component"
-    The scheduler is a standalone module (`openjarvis.scheduler`). It is not wired into the default `Jarvis` / `JarvisSystem` startup. You enable it explicitly via `SystemBuilder` or by starting the CLI daemon with `jarvis scheduler start`.
+!!! note "Where it runs"
+    The scheduler is a standalone module (`openjarvis.scheduler`). `jarvis serve` polls it when `[scheduler] enabled` or `[digest] enabled` is true, which is what a background service such as the Windows service already runs. `jarvis scheduler start` runs the same loop in the foreground and executes due tasks. Passing `system=None` to `TaskScheduler` is still a dry run for library callers and tests.
 
 ---
 
@@ -13,10 +13,10 @@ The task scheduler lets you run agent queries automatically on a schedule -- onc
 |-----------------|------------------------------------|-----------------------------|-------------------------------------|
 | `once`          | ISO 8601 UTC datetime              | `"2026-03-01T09:00:00Z"`    | Run once at that timestamp          |
 | `interval`      | Seconds as a string                | `"3600"`                    | Run every hour, starting immediately |
-| `cron`          | Standard 5-field cron expression   | `"0 9 * * 1-5"`             | 09:00 UTC, Monday–Friday            |
+| `cron`          | Standard 5-field cron expression   | `"0 9 * * 1-5"`             | 09:00 in the task timezone, else UTC |
 
 !!! tip "Cron support"
-    Full cron expression support requires `croniter` (`uv pip install croniter`). Without it, the scheduler uses a minimal built-in parser that handles simple `minute hour * * *` patterns only.
+    Cron expressions require `croniter`, which is installed with OpenJarvis. A missing `croniter` is reported as an error. It is not replaced with an hourly approximation. Put an IANA timezone in the task metadata (`{"timezone": "Asia/Jerusalem"}`) to evaluate the expression in local time; the stored `next_run` is UTC. An unknown timezone is logged once and treated as UTC.
 
 ---
 
@@ -30,7 +30,13 @@ The `jarvis scheduler` subcommand group manages tasks and the daemon from the te
 jarvis scheduler start
 ```
 
-Starts the background polling daemon. The daemon runs in the foreground until interrupted (++ctrl+c++). In production, run it under systemd or launchd (see [Deployment](../deployment/systemd.md)).
+Runs due tasks in the foreground until interrupted (++ctrl+c++). The command builds a Jarvis system and executes each task with its agent. It is not a dry run. If the system cannot be built (for example no inference engine is reachable) the command exits and reports that no tasks were executed.
+
+A task that became due while the process was stopped runs once on startup when it is still inside `misfire_grace_seconds` (default two hours, `7200`). Older misses are skipped and the next future slot is stored, so a daily job does not fire in the evening after a day offline. The slot is claimed in SQLite before it runs, so restarting the process does not run that slot again. Set `misfire_grace_seconds = 0` to always run one missed execution, however late it is.
+
+`jarvis serve` does this on its own when the scheduler or the digest is enabled, which is the usual way to leave schedules running. Use `jarvis scheduler start` when you want the loop in a terminal instead. Do not run both against the same database: the claim prevents a double execution, but two processes will still contend.
+
+In production, prefer `jarvis serve` under systemd, launchd, or the Windows service (see [Deployment](../deployment/systemd.md)).
 
 ### Create a task
 
@@ -221,15 +227,17 @@ Scheduler settings live in the `[scheduler]` section of `~/.openjarvis/config.to
 enabled = false
 db_path = "~/.openjarvis/scheduler.db"
 poll_interval = 60
-default_agent = "simple"
+# Run a missed task once if it is at most this many seconds late.
+# 0 = always catch up one missed run.
+misfire_grace_seconds = 7200
 ```
 
-| Key              | Type   | Default                          | Description                                |
-|------------------|--------|----------------------------------|--------------------------------------------|
-| `enabled`        | `bool` | `false`                          | Start the scheduler daemon automatically   |
-| `db_path`        | `str`  | `~/.openjarvis/scheduler.db`     | SQLite database path                       |
-| `poll_interval`  | `int`  | `60`                             | Seconds between polling cycles             |
-| `default_agent`  | `str`  | `"simple"`                       | Default agent for tasks that omit `agent`  |
+| Key                      | Type   | Default                      | Description                                      |
+|--------------------------|--------|------------------------------|--------------------------------------------------|
+| `enabled`                | `bool` | `false`                      | `jarvis serve` polls scheduled tasks             |
+| `db_path`                | `str`  | `~/.openjarvis/scheduler.db` | SQLite database path                             |
+| `poll_interval`          | `int`  | `60`                         | Seconds between polling cycles                   |
+| `misfire_grace_seconds`  | `int`  | `7200`                       | Max lateness that still runs once. `0` = no cap |
 
 ---
 

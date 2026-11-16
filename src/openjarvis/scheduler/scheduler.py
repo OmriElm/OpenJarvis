@@ -7,12 +7,15 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
-from zoneinfo import ZoneInfo
+from typing import Any, Callable, Dict, List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from openjarvis.scheduler.store import SchedulerStore
 
 logger = logging.getLogger(__name__)
+
+# Timezone names already reported so a bad config does not log on every poll.
+_warned_timezones: set[str] = set()
 
 # Event type strings (avoids editing core EventType enum)
 SCHEDULER_TASK_START = "scheduler_task_start"
@@ -74,6 +77,166 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def parse_utc(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 timestamp into aware UTC.
+
+    Naive values are treated as UTC. A trailing ``Z`` is accepted.
+    Unparseable values return ``None`` instead of raising, so one bad row
+    cannot stop the poll loop.
+
+    Parameters
+    ----------
+    value:
+        Stored timestamp, or ``None``.
+
+    Returns
+    -------
+    datetime or None
+        Aware UTC datetime, or ``None`` when *value* is empty or invalid.
+    """
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _interval_after(now: datetime, schedule_value: str) -> str:
+    """Return ``now`` plus a positive interval, as UTC ISO-8601."""
+    seconds = float(schedule_value)
+    if seconds <= 0:
+        raise ValueError("interval must be positive")
+    return (now + timedelta(seconds=seconds)).isoformat()
+
+
+def grace_window(seconds: int) -> timedelta | None:
+    """Convert a misfire setting into a lateness limit.
+
+    ``seconds <= 0`` means a missed slot always runs once (no upper bound).
+    A positive value is the maximum lateness that still runs. Anything
+    older is skipped and the schedule advances to the next future slot.
+
+    Parameters
+    ----------
+    seconds:
+        ``scheduler.misfire_grace_seconds``.
+
+    Returns
+    -------
+    timedelta or None
+        The window, or ``None`` when catch-up is unbounded.
+    """
+    if seconds <= 0:
+        return None
+    return timedelta(seconds=seconds)
+
+
+def classify_misfire(
+    scheduled_at: datetime,
+    now: datetime,
+    grace: timedelta | None,
+) -> str:
+    """Decide what to do with a stored run time.
+
+    Parameters
+    ----------
+    scheduled_at:
+        The slot stored in ``next_run``.
+    now:
+        The scheduler clock, aware or naive UTC.
+    grace:
+        Maximum lateness that still runs. ``None`` always runs one missed
+        slot.
+
+    Returns
+    -------
+    str
+        ``"wait"`` when the slot is still in the future, ``"run"`` when it
+        should execute once, or ``"skip"`` when it is older than *grace*.
+    """
+    if scheduled_at.tzinfo is None:
+        scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+    else:
+        scheduled_at = scheduled_at.astimezone(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    if scheduled_at > now:
+        return "wait"
+    if grace is None or (now - scheduled_at) <= grace:
+        return "run"
+    return "skip"
+
+
+def interpret_timezone(name: str | None) -> str | None:
+    """Return a usable IANA timezone name, or ``None`` for UTC.
+
+    An empty name means UTC on purpose. An unknown name is logged once
+    and also treated as UTC so a bad digest timezone cannot stall polling.
+
+    Parameters
+    ----------
+    name:
+        IANA name from task metadata, or ``None``.
+
+    Returns
+    -------
+    str or None
+        *name* when ZoneInfo accepts it, otherwise ``None``.
+    """
+    if not name:
+        return None
+    if name in _warned_timezones:
+        return None
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        _warned_timezones.add(name)
+        logger.error(
+            "Invalid timezone %r; interpreting cron schedules as UTC",
+            name,
+        )
+        return None
+    return name
+
+
+def coerce_ask_result(result: Any) -> str:
+    """Turn a scheduler ``ask`` return value into stored text.
+
+    :meth:`JarvisSystem.ask` returns a dict whose ``content`` is the
+    reply. Older callers and tests return a plain string. Non-ASCII
+    content is preserved (``ensure_ascii`` is not used).
+
+    Parameters
+    ----------
+    result:
+        Whatever ``system.ask`` returned.
+
+    Returns
+    -------
+    str
+        The text to log and, for a digest, to deliver.
+    """
+    if isinstance(result, dict):
+        content = result.get("content")
+        if isinstance(content, str):
+            return content
+        import json
+
+        return json.dumps(result, default=str, ensure_ascii=False)
+    if result is None:
+        return ""
+    return str(result)
+
+
 class TaskScheduler:
     """Scheduler that polls for due tasks and executes them.
 
@@ -87,6 +250,20 @@ class TaskScheduler:
         Seconds between poll cycles (default 60).
     bus:
         Optional event bus for publishing scheduler events.
+    clock:
+        Injectable UTC clock. Tests pass this so they do not sleep or
+        depend on the wall clock. Aware datetimes are converted to UTC;
+        naive datetimes are treated as UTC.
+    misfire_grace_seconds:
+        Run a due task once when it is at most this many seconds late.
+        ``0`` or a negative value means a missed task always runs once,
+        however late it is. The default is two hours, which covers a
+        machine that was asleep through a morning digest but not one
+        that was off for days.
+    on_success:
+        Called with ``(task, result_text)`` after a real execution
+        succeeds. Dry-runs (no ``system``) do not call it. Exceptions
+        are logged by type and do not change the task's recorded result.
     """
 
     def __init__(
@@ -96,14 +273,39 @@ class TaskScheduler:
         *,
         poll_interval: int = 60,
         bus: Any = None,
+        clock: Callable[[], datetime] | None = None,
+        misfire_grace_seconds: int = 7200,
+        on_success: Callable[[ScheduledTask, str], None] | None = None,
     ) -> None:
         self._store = store
         self._system = system
-        self._poll_interval = poll_interval
+        self._poll_interval = poll_interval if poll_interval >= 1 else 60
+        if poll_interval < 1:
+            logger.error("poll_interval must be >= 1; using 60")
         self._bus = bus
+        self._clock = clock
+        grace_seconds = _coerce_grace(misfire_grace_seconds)
+        self._grace = grace_window(grace_seconds)
+        self._on_success = on_success
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._warnings: set[str] = set()
+
+    def set_system(self, system: Any) -> None:
+        """Attach the runtime used to execute due tasks.
+
+        ``SystemBuilder`` constructs the scheduler before the system
+        exists. Without this, a later ``start()`` would dry-run.
+        """
+        self._system = system
+
+    def set_on_success(
+        self,
+        callback: Callable[[ScheduledTask, str], None] | None,
+    ) -> None:
+        """Set or clear the callback invoked after a successful real run."""
+        self._on_success = callback
 
     # -- Public API ----------------------------------------------------------
 
@@ -149,6 +351,52 @@ class TaskScheduler:
             self._store.save_task(task.to_dict())
         return task
 
+    def reschedule_task(
+        self,
+        task_id: str,
+        *,
+        schedule_value: str,
+        metadata: Dict[str, Any],
+    ) -> ScheduledTask:
+        """Replace a cron task's expression and recompute ``next_run``.
+
+        Used when the digest config changes. The task id is kept so run
+        history stays attached. The task is left ``active``.
+
+        Parameters
+        ----------
+        task_id:
+            Existing task.
+        schedule_value:
+            New cron expression.
+        metadata:
+            Replacement metadata. Callers merge keys they want to keep.
+
+        Returns
+        -------
+        ScheduledTask
+            The updated task.
+
+        Raises
+        ------
+        KeyError
+            If *task_id* does not exist.
+        RuntimeError
+            If cron support is missing or the expression is invalid.
+        """
+        with self._lock:
+            current = self._store.get_task(task_id)
+            if current is None:
+                raise KeyError(f"Task not found: {task_id}")
+            current["schedule_type"] = "cron"
+            current["schedule_value"] = schedule_value
+            current["metadata"] = metadata
+            current["status"] = "active"
+            task = ScheduledTask.from_dict(current)
+            task.next_run = self._compute_next_run(task)
+            self._store.update_task(task.to_dict())
+            return task
+
     def list_tasks(self, *, status: Optional[str] = None) -> List[ScheduledTask]:
         """Return tasks, optionally filtered by *status*."""
         with self._lock:
@@ -192,19 +440,136 @@ class TaskScheduler:
         """Poll for due tasks and execute them until stopped."""
         while not self._stop_event.is_set():
             try:
-                now = _now_iso()
-                with self._lock:
-                    due = self._store.get_due_tasks(now)
-                for task_dict in due:
-                    task = ScheduledTask.from_dict(task_dict)
-                    self._execute_task(task)
+                self.poll_once()
             except Exception:
                 logger.exception("Scheduler poll error")
             self._stop_event.wait(timeout=self._poll_interval)
 
-    def _execute_task(self, task: ScheduledTask) -> None:
-        """Execute a single due task and log the result."""
-        started_at = _now_iso()
+    def poll_once(self) -> List[str]:
+        """Handle every task that is due at the scheduler clock.
+
+        The first thing the background loop does, so a restart runs a
+        missed slot immediately when it is still inside the grace window.
+        Each slot is claimed in SQLite before it runs. A second scheduler
+        pointed at the same database, or this process after a restart,
+        will not execute that slot again.
+
+        Tasks outside the grace window are not executed. Their ``next_run``
+        moves to the next future slot and a run log records the skip.
+        One-shot tasks that are skipped are marked completed.
+
+        Returns
+        -------
+        list[str]
+            Ids of tasks that were claimed, whether they ran or were
+            skipped as too late.
+        """
+        now = self._now()
+        try:
+            with self._lock:
+                due = self._store.get_due_tasks(now.isoformat())
+        except Exception:
+            logger.exception("Scheduler failed to read due tasks")
+            return []
+
+        handled: List[str] = []
+        for task_dict in due:
+            task_id = str(task_dict.get("id", ""))
+            try:
+                task = ScheduledTask.from_dict(task_dict)
+                if self._handle_due_task(task, now):
+                    handled.append(task.id)
+            except Exception:
+                logger.exception("Scheduler failed to handle task %s", task_id)
+        return handled
+
+    def _handle_due_task(self, task: ScheduledTask, now: datetime) -> bool:
+        """Claim and run or skip one due task. Return True when claimed."""
+        scheduled = parse_utc(task.next_run)
+        if scheduled is None:
+            self._warn_once(task.id, "next_run is missing or not ISO-8601")
+            return False
+        if classify_misfire(scheduled, now, self._grace) == "wait":
+            # String ordering in SQLite can surface a row that is not
+            # actually due yet when timestamp formats differ.
+            return False
+        try:
+            following = self._compute_following_run(task, now)
+        except (RuntimeError, ValueError, TypeError):
+            self._warn_once(task.id, "schedule could not be advanced")
+            return False
+        if task.schedule_type != "once" and following is None:
+            self._warn_once(task.id, "schedule produced no following run")
+            return False
+
+        action = classify_misfire(scheduled, now, self._grace)
+        new_status = "completed" if task.schedule_type == "once" else None
+        claimed_at = now.isoformat()
+        with self._lock:
+            owned = self._store.claim_due_task(
+                task.id,
+                task.next_run or "",
+                new_next_run=following,
+                claimed_at=claimed_at,
+                new_status=new_status,
+            )
+        if not owned:
+            logger.info("Task %s was already claimed", task.id)
+            return False
+
+        if action == "skip":
+            late = int((now - scheduled).total_seconds())
+            grace_s = int(self._grace.total_seconds()) if self._grace is not None else 0
+            logger.info(
+                "Task %s is %d seconds late (grace %d); skipping this slot",
+                task.id,
+                late,
+                grace_s,
+            )
+            with self._lock:
+                self._store.log_run(
+                    task_id=task.id,
+                    started_at=claimed_at,
+                    finished_at=claimed_at,
+                    success=False,
+                    result="",
+                    error=(
+                        f"missed: overdue by {late}s, "
+                        f"outside misfire grace of {grace_s}s"
+                    ),
+                )
+            return True
+
+        logger.info("Running scheduled task %s (agent=%s)", task.id, task.agent)
+        self._execute_task(task, advance_schedule=False)
+        return True
+
+    def _warn_once(self, task_id: str, message: str) -> None:
+        """Log a per-task schedule problem once per process."""
+        if task_id in self._warnings:
+            return
+        self._warnings.add(task_id)
+        logger.error("Task %s was not run: %s", task_id, message)
+
+    def _execute_task(
+        self,
+        task: ScheduledTask,
+        *,
+        advance_schedule: bool = True,
+    ) -> None:
+        """Execute one task.
+
+        Parameters
+        ----------
+        task:
+            Task to run. Its prompt and agent are read from this object.
+        advance_schedule:
+            When true (direct callers, including tests), ``next_run`` is
+            recomputed after the run. The poll loop claims the next slot
+            first and passes false so a successful run is not advanced
+            twice.
+        """
+        started_at = self._now().isoformat()
 
         # Publish start event
         if self._bus is not None:
@@ -216,6 +581,7 @@ class TaskScheduler:
         success = False
         result_text = ""
         error_text = ""
+        ran_for_real = self._system is not None
 
         try:
             if self._system is not None:
@@ -235,9 +601,11 @@ class TaskScheduler:
                 if meta.get("operator_id"):
                     ask_kwargs["system_prompt"] = meta.get("system_prompt", "")
                     ask_kwargs["operator_id"] = meta["operator_id"]
-                result_text = self._system.ask(
-                    task.prompt,
-                    **ask_kwargs,
+                result_text = coerce_ask_result(
+                    self._system.ask(
+                        task.prompt,
+                        **ask_kwargs,
+                    )
                 )
             else:
                 result_text = f"[dry-run] Would execute: {task.prompt}"
@@ -246,7 +614,7 @@ class TaskScheduler:
             error_text = str(exc)
             logger.error("Task %s failed: %s", task.id, exc)
 
-        finished_at = _now_iso()
+        finished_at = self._now().isoformat()
 
         # Log the run
         with self._lock:
@@ -259,14 +627,33 @@ class TaskScheduler:
                 error=error_text,
             )
 
-            # Update task state
+            # Update task state. The poll loop has already claimed the next
+            # slot; advancing again would skip a future occurrence.
             d = self._store.get_task(task.id)
             if d is not None:
                 d["last_run"] = finished_at
-                next_run = self._compute_next_run(ScheduledTask.from_dict(d))
-                d["next_run"] = next_run
-                if next_run is None:
-                    d["status"] = "completed"
+                if advance_schedule:
+                    next_run = self._compute_next_run(ScheduledTask.from_dict(d))
+                    d["next_run"] = next_run
+                    if next_run is None:
+                        d["status"] = "completed"
+                elif task.schedule_type == "interval":
+                    # The claim stored start+interval so a crash cannot repeat
+                    # this slot. A run that lasts longer than the interval
+                    # would otherwise be due again on the next poll.
+                    try:
+                        pushed = _interval_after(
+                            self._now(),
+                            str(task.schedule_value),
+                        )
+                    except (TypeError, ValueError):
+                        pushed = ""
+                    proposed = parse_utc(pushed)
+                    current = parse_utc(d.get("next_run"))
+                    if proposed is not None and (
+                        current is None or proposed >= current
+                    ):
+                        d["next_run"] = pushed
                 self._store.update_task(d)
 
         # Publish end event
@@ -281,12 +668,53 @@ class TaskScheduler:
                 },
             )
 
+        if success and ran_for_real and self._on_success is not None:
+            try:
+                self._on_success(task, result_text)
+            except Exception as exc:
+                logger.warning(
+                    "Post-run callback for task %s failed (%s)",
+                    task.id,
+                    type(exc).__name__,
+                )
+
+    def _now(self) -> datetime:
+        """Return the scheduler clock as aware UTC."""
+        if self._clock is not None:
+            now = self._clock()
+        else:
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            return now.replace(tzinfo=timezone.utc)
+        return now.astimezone(timezone.utc)
+
+    def _compute_following_run(
+        self,
+        task: ScheduledTask,
+        now: datetime,
+    ) -> Optional[str]:
+        """Return the slot after the current one is consumed.
+
+        Interval tasks are measured from *now*, not from the missed slot,
+        so a long outage cannot queue a burst of catch-up runs. Cron uses
+        the next future match after *now*. A one-shot task does not run
+        again.
+        """
+        if task.schedule_type == "once":
+            return None
+        if task.schedule_type == "interval":
+            return _interval_after(now, task.schedule_value)
+        if task.schedule_type == "cron":
+            timezone_name = str((task.metadata or {}).get("timezone") or "") or None
+            return self._compute_next_cron(task.schedule_value, now, timezone_name)
+        raise ValueError(f"unknown schedule type {task.schedule_type!r}")
+
     def _compute_next_run(self, task: ScheduledTask) -> Optional[str]:
         """Compute the next run time for a task.
 
         Returns an ISO 8601 string, or ``None`` if the task should not run again.
         """
-        now = datetime.now(timezone.utc)
+        now = self._now()
 
         if task.schedule_type == "once":
             # If already run, no more runs
@@ -326,6 +754,7 @@ class TaskScheduler:
 
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
+        timezone_name = interpret_timezone(timezone_name)
         local_now = now.astimezone(ZoneInfo(timezone_name)) if timezone_name else now
         next_local = croniter(cron_expr, local_now).get_next(datetime)
         if next_local.tzinfo is None:
@@ -333,9 +762,26 @@ class TaskScheduler:
         return next_local.astimezone(timezone.utc).isoformat()
 
 
+def _coerce_grace(value: Any) -> int:
+    """Return an int grace, logging and using two hours when *value* is bad."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.error(
+            "Invalid misfire_grace_seconds (%s); using 7200",
+            type(value).__name__,
+        )
+        return 7200
+
+
 __all__ = [
     "SCHEDULER_TASK_END",
     "SCHEDULER_TASK_START",
     "ScheduledTask",
     "TaskScheduler",
+    "classify_misfire",
+    "coerce_ask_result",
+    "grace_window",
+    "interpret_timezone",
+    "parse_utc",
 ]

@@ -299,6 +299,11 @@ def create_app(
     app.state.speech_backend = speech_backend
     app.state.agent_manager = agent_manager
     app.state.agent_scheduler = agent_scheduler
+    # Filled in by ``jarvis serve`` after create_app returns. Shutdown below
+    # reads the attributes then, so a server that never starts the task
+    # scheduler still closes cleanly.
+    app.state.task_scheduler = None
+    app.state.task_scheduler_store = None
     # Security primitives for the managed-agent HTTP/SSE routes
     # (agent_manager_routes.py). Previously never passed here at all, so
     # every managed agent reached over the network ran with no RBAC gate,
@@ -461,6 +466,22 @@ def create_app(
     @app.on_event("shutdown")
     async def _shutdown_analytics() -> None:
         stop_analytics(app)
+
+    @app.on_event("shutdown")
+    async def _shutdown_task_scheduler() -> None:
+        sched = getattr(app.state, "task_scheduler", None)
+        if sched is not None:
+            try:
+                sched.stop()
+            except Exception:
+                logger.debug("Task scheduler shutdown failed", exc_info=True)
+        store = getattr(app.state, "task_scheduler_store", None)
+        close_store = getattr(store, "close", None)
+        if callable(close_store):
+            try:
+                close_store()
+            except Exception:
+                logger.debug("Task scheduler store shutdown failed", exc_info=True)
 
     # Stop the background memory service cleanly when the server shuts down.
     if memory_service is not None:

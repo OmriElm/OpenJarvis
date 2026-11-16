@@ -1572,6 +1572,12 @@ class SchedulerConfig:
     enabled: bool = False
     poll_interval: int = 60
     db_path: str = ""  # Defaults to ~/.openjarvis/scheduler.db
+    # Run a missed task once when the process starts within this many
+    # seconds of its scheduled time. Older misses are skipped and the next
+    # future slot is stored, so a laptop that was off all day does not fire
+    # a stale morning digest at evening boot. 0 (or negative) means always
+    # run one missed execution, however late it is.
+    misfire_grace_seconds: int = 7200
 
 
 @dataclass(slots=True)
@@ -1730,6 +1736,15 @@ class DigestSectionConfig:
     sources: List[str] = field(default_factory=list)
     max_items: int = 10
     priority_contacts: List[str] = field(default_factory=list)
+    # When true on [digest.messages], gmail / gmail_imap / imap / outlook
+    # contribute only unread mail. The fetch uses BODY.PEEK (IMAP) or
+    # is:unread (Gmail API) and does not mark messages read. Default false
+    # keeps the historical "everything in the digest window" behavior.
+    unread_only: bool = False
+    # How far back unread mail is still included. 168 hours (7 days) keeps
+    # a message from a few days ago. 0 means every unread message, with
+    # no date cutoff. Ignored unless unread_only is true.
+    unread_hours_back: int = 168
 
 
 @dataclass
@@ -1747,6 +1762,12 @@ class DigestConfig:
         default_factory=lambda: ["github", "financial", "music", "fitness"]
     )
     honorific: str = "sir"
+    # "spoken" is a prose script for text-to-speech (the historical default).
+    # "text" is a scannable plain-text message for a chat channel. Unknown
+    # values are treated as spoken when the digest is generated.
+    style: str = "spoken"
+    # Word budget for the whole briefing. The spoken default is 200.
+    max_words: int = 200
     voice_id: str = ""
     voice_speed: float = 1.0
     tts_backend: str = "cartesia"
@@ -1764,6 +1785,13 @@ class DigestConfig:
     world: DigestSectionConfig = field(
         default_factory=lambda: DigestSectionConfig(sources=[])
     )
+    # Destinations for the generated digest text. Each entry is
+    # "channel:destination", for example "telegram:123456789". Empty
+    # disables delivery. The Telegram bot token is read from
+    # [channel.telegram] bot_token or the TELEGRAM_BOT_TOKEN environment
+    # variable and is never logged. Long messages are split under
+    # Telegram's 4096-character limit.
+    deliver_to: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2492,6 +2520,8 @@ ssrf_protection = true
 # enabled = false
 # poll_interval = 60
 # db_path = ""                # Defaults to ~/.openjarvis/scheduler.db
+# misfire_grace_seconds = 7200  # Run a missed task once if it is at most this
+#                               # many seconds late. 0 = always catch up once.
 
 # [channel.whatsapp_baileys]
 # auth_dir = ""               # Defaults to ~/.openjarvis/whatsapp_auth

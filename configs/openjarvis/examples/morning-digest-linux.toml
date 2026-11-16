@@ -29,7 +29,10 @@ enabled = ["code_interpreter", "web_search", "file_read", "shell_exec", "digest_
 [digest]
 enabled = true
 schedule = "0 7 * * *"
-timezone = "America/New_York"      # Change to your timezone
+timezone = "America/New_York"      # IANA name, e.g. "Asia/Jerusalem"
+# style = "text"                       # scannable chat layout; speech stays spoken
+# max_words = 350
+# deliver_to = ["telegram:123456789"]  # plain-text push; token is not logged
 persona = "jarvis"
 honorific = "sir"
 tts_backend = "openai"             # OpenAI TTS works everywhere
@@ -43,6 +46,8 @@ sources = ["oura"]
 
 [digest.messages]
 sources = ["gmail", "google_tasks", "slack"]
+# unread_only = true
+# unread_hours_back = 168     # 7 days of unread mail; 0 = no date cutoff
 
 [digest.calendar]
 sources = ["gcalendar"]

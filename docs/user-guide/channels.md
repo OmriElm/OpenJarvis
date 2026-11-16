@@ -205,8 +205,10 @@ jarvis channel list
 ### Send a Message
 
 ```bash
-# Send to a channel by name
-jarvis channel send telegram "Build completed successfully"
+# The first argument is the destination, not the channel type.
+# For Telegram that is the chat id. The bot token comes from
+# [channel.telegram] bot_token or the TELEGRAM_BOT_TOKEN environment variable.
+jarvis channel send 123456789 "Build completed successfully" --channel-type telegram
 ```
 
 ### Show Status
