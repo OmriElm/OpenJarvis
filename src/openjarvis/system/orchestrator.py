@@ -206,6 +206,8 @@ class QueryOrchestrator:
                     "honorific": dc.honorific,
                     "style": dc.style,
                     "max_words": dc.max_words,
+                    "messages_unread_only": dc.messages.unread_only,
+                    "messages_unread_hours_back": dc.messages.unread_hours_back,
                 }
             )
             from openjarvis.tools.digest_collect import DigestCollectTool

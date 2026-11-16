@@ -133,6 +133,50 @@ def normalize_max_words(value: Any) -> int:
     return words
 
 
+def _as_bool(value: Any) -> bool:
+    """Coerce a config flag without treating the string ``false`` as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def normalize_unread_hours(value: Any) -> int:
+    """Return the unread window in hours.
+
+    ``0`` means no date cutoff. A missing or negative value uses 168
+    (seven days), so an unread message from a few days ago is still
+    included and a year-old unread pile is not.
+
+    Parameters
+    ----------
+    value:
+        Raw ``digest.messages.unread_hours_back``.
+
+    Returns
+    -------
+    int
+        A non-negative hour count.
+    """
+    if isinstance(value, bool) or value is None:
+        return 168
+    if isinstance(value, str):
+        value = value.strip()
+    try:
+        hours = int(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid digest.messages.unread_hours_back; using 168")
+        return 168
+    if hours < 0:
+        logger.warning(
+            "digest.messages.unread_hours_back must be >= 0 (got %d); using 168",
+            hours,
+        )
+        return 168
+    return hours
+
+
 def _section_block(sections: List[str]) -> str:
     """Return the configured-section lines, in first-seen order."""
     ordered = dict.fromkeys(
@@ -178,6 +222,10 @@ def digest_format_instructions(
         "- NEVER mention disconnected or unavailable sources.\n"
         "- NEVER invent personal context or claim, offer, or suggest actions.\n"
         "- Acknowledge every source that returned data, even briefly.\n"
+        "- If the collected data reports a mailbox was checked and has no "
+        "unread emails, say that there are no new emails, in the persona's "
+        "language. That statement is required. Do not treat the mailbox as "
+        "absent and do not invent emails.\n"
         f"- STRICT LIMIT: {max_words} words. Be concise."
     )
     if style != STYLE_TEXT:
@@ -247,7 +295,9 @@ def digest_user_suffix(style: str, max_words: int) -> str:
         "Use configured sections only. Omit missing data and sources. "
         "Do not add personal context or activities. "
         "Use the honorific no more than three times and keep the "
-        f"briefing under {max_words} words."
+        f"briefing under {max_words} words. "
+        "A mailbox check that reports zero unread emails is not missing "
+        "data; say there are no new emails in the persona's language."
     )
     if style == STYLE_TEXT:
         return (
@@ -327,7 +377,24 @@ class MorningDigestAgent(ToolUsingAgent):
         self._max_words = normalize_max_words(
             kwargs.pop("max_words", DEFAULT_MAX_WORDS)
         )
+        self._messages_unread_only = _as_bool(kwargs.pop("messages_unread_only", False))
+        self._messages_unread_hours_back = normalize_unread_hours(
+            kwargs.pop("messages_unread_hours_back", 168)
+        )
         super().__init__(*args, **kwargs)
+
+    def _collect_params(self, sources: List[str]) -> dict[str, Any]:
+        """Arguments for ``digest_collect``.
+
+        Non-mail sources keep the 24-hour digest window. When unread mail
+        is requested, email connectors get that flag and their own window
+        (``0`` means every unread message).
+        """
+        payload: dict[str, Any] = {"sources": sources, "hours_back": 24}
+        if self._messages_unread_only:
+            payload["email_unread_only"] = True
+            payload["email_hours_back"] = self._messages_unread_hours_back
+        return payload
 
     def _configured_section_names(self) -> List[str]:
         """Return configured section names, lower-cased, first-seen order."""
@@ -482,7 +549,7 @@ class MorningDigestAgent(ToolUsingAgent):
         collect_call = ToolCall(
             id="digest-collect-1",
             name="digest_collect",
-            arguments=json.dumps({"sources": sources, "hours_back": 24}),
+            arguments=json.dumps(self._collect_params(sources)),
         )
         collect_result = self._executor.execute(collect_call)
         collected_data = collect_result.content

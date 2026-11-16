@@ -518,6 +518,8 @@ class Jarvis:
                     "honorific": dc.honorific,
                     "style": dc.style,
                     "max_words": dc.max_words,
+                    "messages_unread_only": dc.messages.unread_only,
+                    "messages_unread_hours_back": dc.messages.unread_hours_back,
                 }
             )
             # Ensure digest agent always has its required tools

@@ -21,6 +21,28 @@ def _agent(**kwargs: object) -> MorningDigestAgent:
     return MorningDigestAgent(MagicMock(), "test-model", tools=[], **kwargs)
 
 
+def test_unread_mail_is_opt_in_and_uses_its_own_window() -> None:
+    import json
+
+    quiet = _agent(sections=["messages"], section_sources={"messages": ["gmail_imap"]})
+    assert "email_unread_only" not in quiet._collect_params(["gmail_imap"])
+
+    agent = _agent(
+        sections=["messages"],
+        section_sources={"messages": ["gmail_imap"]},
+        messages_unread_only=True,
+        messages_unread_hours_back=168,
+    )
+    payload = agent._collect_params(["gmail_imap"])
+    assert payload["email_unread_only"] is True
+    assert payload["email_hours_back"] == 168
+    assert payload["hours_back"] == 24
+    assert json.loads(json.dumps(payload))["email_unread_only"] is True
+    prompt = agent._build_system_prompt()
+    assert "no new emails" in prompt
+    assert "persona's language" in prompt
+
+
 def test_defaults_stay_spoken() -> None:
     cfg = DigestConfig()
     assert cfg.style == "spoken"

@@ -1736,6 +1736,15 @@ class DigestSectionConfig:
     sources: List[str] = field(default_factory=list)
     max_items: int = 10
     priority_contacts: List[str] = field(default_factory=list)
+    # When true on [digest.messages], gmail / gmail_imap / imap / outlook
+    # contribute only unread mail. The fetch uses BODY.PEEK (IMAP) or
+    # is:unread (Gmail API) and does not mark messages read. Default false
+    # keeps the historical "everything in the digest window" behavior.
+    unread_only: bool = False
+    # How far back unread mail is still included. 168 hours (7 days) keeps
+    # a message from a few days ago. 0 means every unread message, with
+    # no date cutoff. Ignored unless unread_only is true.
+    unread_hours_back: int = 168
 
 
 @dataclass

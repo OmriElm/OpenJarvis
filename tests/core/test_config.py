@@ -9,6 +9,7 @@ import tomllib
 from openjarvis.core.config import (
     AgentConfig,
     ChannelConfig,
+    DigestConfig,
     EngineConfig,
     GpuInfo,
     HardwareInfo,
@@ -518,7 +519,12 @@ class TestSchedulerConfig:
             "\n"
             "[scheduler]\n"
             "enabled = true\n"
-            "misfire_grace_seconds = 900\n",
+            "misfire_grace_seconds = 900\n"
+            "\n"
+            "[digest.messages]\n"
+            'sources = ["gmail_imap"]\n'
+            "unread_only = true\n"
+            "unread_hours_back = 72\n",
             encoding="utf-8",
         )
         cfg = load_config(toml_file)
@@ -530,6 +536,11 @@ class TestSchedulerConfig:
         assert cfg.digest.deliver_to == ["telegram:123", "telegram:-1005"]
         assert cfg.scheduler.enabled is True
         assert cfg.scheduler.misfire_grace_seconds == 900
+        assert cfg.digest.messages.sources == ["gmail_imap"]
+        assert cfg.digest.messages.unread_only is True
+        assert cfg.digest.messages.unread_hours_back == 72
+        assert DigestConfig().messages.unread_only is False
+        assert DigestConfig().messages.unread_hours_back == 168
 
 
 # ---------------------------------------------------------------------------

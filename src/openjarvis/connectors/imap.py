@@ -269,8 +269,9 @@ class IMAPConnector(GmailIMAPConnector):
         *,
         since: Optional[datetime] = None,
         cursor: Optional[str] = None,
+        unread_only: bool = False,
     ) -> Iterator[Document]:
-        for doc in super().sync(since=since, cursor=cursor):
+        for doc in super().sync(since=since, cursor=cursor, unread_only=unread_only):
             doc.source = self.connector_id
             doc.doc_id = doc.doc_id.replace("gmail:", f"{self.connector_id}:", 1)
             # A generic mailbox must not link every result to Gmail.

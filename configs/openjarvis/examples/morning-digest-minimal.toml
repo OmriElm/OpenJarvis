@@ -34,6 +34,8 @@ sections = ["messages", "calendar"]
 
 [digest.messages]
 sources = ["gmail"]
+# unread_only = true          # skip mail that is already read
+# unread_hours_back = 168     # 7 days; 0 = every unread message
 
 [digest.calendar]
 sources = ["gcalendar"]

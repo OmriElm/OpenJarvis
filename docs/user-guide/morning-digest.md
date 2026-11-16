@@ -196,10 +196,25 @@ The `sections` list controls what the digest covers, in order of priority:
 | Section | Sources | What it provides |
 |---------|---------|-----------------|
 | `health` | `oura`, `apple_health`, `strava` | Sleep, readiness, activity, workouts |
-| `messages` | `gmail`, `google_tasks`, `slack`, `notion`, `imessage`, `github_notifications` | Email triage, tasks, texts, Slack, PRs |
+| `messages` | `gmail`, `gmail_imap`, `imap`, `google_tasks`, `slack`, `notion`, `imessage`, `github_notifications` | Email triage, tasks, texts, Slack, PRs |
 | `calendar` | `gcalendar` | Today's events and schedule |
 | `world` | `weather`, `hackernews`, `news_rss` | Weather forecast, tech news, RSS feeds |
 | `music` | `spotify`, `apple_music` | Recently played tracks (opt-in) |
+
+### Unread email only
+
+By default the messages section includes whatever the connector returns inside the digest window, read mail included. Set `unread_only` to mention only mail that is still unread. Already-read messages are not fetched and are not mentioned. The mailbox is opened read-only and IMAP fetches use `BODY.PEEK[]`, so the digest does not mark those messages as read.
+
+An unread message from a few days ago is still relevant, so the unread search is not limited to the usual 24-hour digest window. `unread_hours_back` defaults to `168` (7 days). `0` means every unread message, with no date cutoff. The filter is applied on the server (`UNSEEN` plus `SINCE` for IMAP, `is:unread` plus `after:` for the Gmail API). It applies to `gmail`, `gmail_imap`, `imap`, and `outlook`.
+
+If the mailbox check finds nothing unread, the collected data says so explicitly. The briefing must state that there are no new emails, in the persona's language (a Hebrew persona says something like "אין מיילים חדשים"), instead of dropping the section or inventing mail.
+
+```toml
+[digest.messages]
+sources = ["gmail_imap"]
+unread_only = true
+unread_hours_back = 168   # 7 days; 0 = all unread mail
+```
 
 ### TTS Voices
 

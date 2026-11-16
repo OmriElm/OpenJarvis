@@ -12,7 +12,7 @@ import email as email_lib
 import imaplib
 import logging
 import ssl
-from datetime import datetime
+from datetime import datetime, timezone
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from imaplib import IMAP4
@@ -31,6 +31,24 @@ _IMAP_TIMEOUT_SECONDS = 30
 _SECURITY_TLS = "tls"
 _SECURITY_STARTTLS = "starttls"
 _UIDVALIDITY_ATTRIBUTE = "_openjarvis_uidvalidity"
+# RFC822 sets \\Seen. BODY.PEEK[] is the same bytes and leaves flags alone,
+# including on servers that ignore EXAMINE's read-only bit.
+_FETCH_FULL = "(RFC822)"
+_FETCH_PEEK = "(BODY.PEEK[])"
+_IMAP_MONTHS = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
 
 
 def _normalize_imap_security(value: str) -> str:
@@ -56,6 +74,49 @@ def _normalize_imap_port(value: object, security: str) -> int:
     if not 1 <= port <= 65535:
         raise ValueError("IMAP port must be an integer between 1 and 65535")
     return port
+
+
+def imap_search_terms(
+    *,
+    unread_only: bool = False,
+    since: Optional[datetime] = None,
+) -> List[str]:
+    """Return IMAP ``UID SEARCH`` criteria, excluding the charset argument.
+
+    ``UNSEEN`` and ``SINCE`` are evaluated by the server, so the client does
+    not download the rest of the mailbox. ``SINCE`` is a calendar day in
+    UTC (``DD-Mon-YYYY``), inclusive, which is slightly wider than an hour
+    window and will not drop a message from earlier that day. No criteria
+    means ``ALL``, the historical full-mailbox scan.
+
+    Parameters
+    ----------
+    unread_only:
+        Restrict the search to messages without the ``\\Seen`` flag.
+    since:
+        Include messages on or after this moment. Aware values are
+        converted to UTC before the day is taken. Naive values are used
+        as a civil date directly.
+
+    Returns
+    -------
+    list[str]
+        Arguments for ``imap.uid("SEARCH", None, *terms)``.
+    """
+    terms: List[str] = []
+    if unread_only:
+        terms.append("UNSEEN")
+    if since is not None:
+        day = since.astimezone(timezone.utc) if since.tzinfo is not None else since
+        terms.extend(
+            [
+                "SINCE",
+                f"{day.day:02d}-{_IMAP_MONTHS[day.month - 1]}-{day.year}",
+            ]
+        )
+    if not terms:
+        return ["ALL"]
+    return terms
 
 
 def _decode_header(raw: object) -> str:
@@ -357,6 +418,7 @@ class GmailIMAPConnector(BaseConnector):
         *,
         since: Optional[datetime] = None,
         cursor: Optional[str] = None,
+        unread_only: bool = False,
     ) -> Iterator[Document]:
         em, pw = self._resolve_credentials()
         if not em or not pw:
@@ -373,13 +435,16 @@ class GmailIMAPConnector(BaseConnector):
         synced = 0
         try:
             uidvalidity = str(getattr(imap, _UIDVALIDITY_ATTRIBUTE))
-            # SEARCH ALL is deliberate: pipeline dedup makes a complete scan
-            # safe while avoiding gaps after an interrupted backfill.
-            status, data = imap.uid("SEARCH", None, "ALL")
+            # No criteria keeps the historical full scan. A caller that
+            # passes since and/or unread_only gets a server-side filter
+            # instead of downloading the mailbox and discarding it.
+            terms = imap_search_terms(unread_only=unread_only, since=since)
+            status, data = imap.uid("SEARCH", None, *terms)
             if status != "OK" or not data or data[0] is None:
-                logger.error("IMAP UID SEARCH ALL failed: %s", status)
+                logger.error("IMAP UID SEARCH failed: %s", status)
                 return
             message_uids = data[0].split() if data[0] else []
+            fetch_spec = _FETCH_PEEK if unread_only else _FETCH_FULL
             self._items_total = len(message_uids)
             ordered = list(reversed(message_uids))
             if self._max_messages is not None and self._max_messages > 0:
@@ -391,7 +456,7 @@ class GmailIMAPConnector(BaseConnector):
             while index < len(ordered):
                 message_uid = ordered[index]
                 try:
-                    status, msg_data = imap.uid("FETCH", message_uid, "(RFC822)")
+                    status, msg_data = imap.uid("FETCH", message_uid, fetch_spec)
                     message_record = next(
                         (
                             item

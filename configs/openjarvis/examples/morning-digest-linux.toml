@@ -46,6 +46,8 @@ sources = ["oura"]
 
 [digest.messages]
 sources = ["gmail", "google_tasks", "slack"]
+# unread_only = true
+# unread_hours_back = 168     # 7 days of unread mail; 0 = no date cutoff
 
 [digest.calendar]
 sources = ["gcalendar"]

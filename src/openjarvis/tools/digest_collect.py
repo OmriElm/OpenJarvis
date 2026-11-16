@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from openjarvis.connectors._stubs import Document
 from openjarvis.core.registry import ConnectorRegistry, ToolRegistry
@@ -42,6 +42,9 @@ _CONNECTOR_TO_SECTION: Dict[str, str] = {}
 for _section_name, _ids in _SECTION_ORDER:
     for _cid in _ids:
         _CONNECTOR_TO_SECTION[_cid] = _section_name
+
+# Mailboxes that can be limited to unread mail without a local scan.
+_EMAIL_CONNECTORS = frozenset({"gmail", "gmail_imap", "imap", "outlook"})
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +423,62 @@ def _filter_pending_invites(docs: List[Document]) -> List[Document]:
     return pending
 
 
+def _email_since(
+    default_since: datetime,
+    hours_back: float,
+    email_hours_back: Any,
+) -> Optional[datetime]:
+    """Return the cutoff for an unread mailbox search.
+
+    ``None`` for *email_hours_back* uses the digest's normal window.
+    ``0`` means no date cutoff: every unread message. A positive value
+    is hours before now.
+
+    Parameters
+    ----------
+    default_since:
+        Cutoff already computed from ``hours_back``.
+    hours_back:
+        The digest window, used only when *email_hours_back* is omitted.
+    email_hours_back:
+        Override from ``digest.messages.unread_hours_back``.
+
+    Returns
+    -------
+    datetime or None
+        The cutoff, or ``None`` when the search should not use ``SINCE``.
+    """
+    if email_hours_back is None:
+        return default_since
+    try:
+        window = float(email_hours_back)
+    except (TypeError, ValueError):
+        return datetime.now() - timedelta(hours=hours_back)
+    if window <= 0:
+        return None
+    return datetime.now() - timedelta(hours=window)
+
+
+def _empty_unread_line(source: str, since: Optional[datetime]) -> str:
+    """Describe a mailbox that was checked and had no unread mail.
+
+    The wording is evidence for the model, not the sentence it should
+    copy. The briefing prompt tells it to say this in the persona's
+    language.
+    """
+    if since is None:
+        window = "with no date limit"
+    else:
+        elapsed = max(1, int(round((datetime.now() - since).total_seconds() / 3600)))
+        window = f"in the last {elapsed} hours"
+    return (
+        f"[{source}] MAILBOX CHECKED: 0 unread emails {window}. "
+        "This source responded and has no unread mail. "
+        "Tell the user there are no new emails, in the persona's language. "
+        "Do not omit this source and do not invent emails."
+    )
+
+
 @ToolRegistry.register("digest_collect")
 class DigestCollectTool(BaseTool):
     """Collect recent data from multiple connectors for digest synthesis."""
@@ -459,6 +518,21 @@ class DigestCollectTool(BaseTool):
                             "unread emails, unanswered iMessage threads, pending calendar invites."
                         ),
                     },
+                    "email_unread_only": {
+                        "type": "boolean",
+                        "description": (
+                            "When true, gmail, gmail_imap, imap, and outlook return "
+                            "only unread mail. The fetch does not mark messages read."
+                        ),
+                    },
+                    "email_hours_back": {
+                        "type": "number",
+                        "description": (
+                            "Window for email_unread_only, in hours. "
+                            "Omit to use hours_back. 0 means every unread message, "
+                            "with no date cutoff."
+                        ),
+                    },
                     "seen_ids": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -478,11 +552,17 @@ class DigestCollectTool(BaseTool):
         sources: List[str] = params.get("sources", [])
         hours_back: float = params.get("hours_back", 24)
         unacted_only: bool = bool(params.get("unacted_only", False))
+        email_unread_only: bool = bool(params.get("email_unread_only", False))
         seen_ids: set = set(params.get("seen_ids", []))
         since = datetime.now() - timedelta(hours=hours_back)
+        email_since = _email_since(since, hours_back, params.get("email_hours_back"))
 
         # Collect raw documents per source
         collected_docs: Dict[str, List[Document]] = {}
+        # Email sources that answered and had nothing unread. These stay in
+        # the summary so the model says "no new emails" instead of skipping
+        # the mailbox as if it had not been checked.
+        empty_unread: Dict[str, Optional[datetime]] = {}
         errors: List[str] = []
 
         for source in sources:
@@ -504,9 +584,18 @@ class DigestCollectTool(BaseTool):
                 max_per_source = 15
                 docs: List[Document] = []
 
-                sync_kwargs: Dict[str, Any] = {"since": since}
-                if unacted_only and source == "gmail":
-                    sync_kwargs["query_extra"] = "is:unread"
+                source_since = since
+                sync_kwargs: Dict[str, Any] = {"since": source_since}
+                restrict_email = (email_unread_only or unacted_only) and (
+                    source in _EMAIL_CONNECTORS
+                )
+                if restrict_email:
+                    source_since = email_since if email_unread_only else since
+                    sync_kwargs["since"] = source_since
+                    if source == "gmail":
+                        sync_kwargs["query_extra"] = "is:unread"
+                    else:
+                        sync_kwargs["unread_only"] = True
 
                 for d in connector.sync(**sync_kwargs):
                     if d.doc_id not in seen_ids:
@@ -521,6 +610,8 @@ class DigestCollectTool(BaseTool):
                     docs = _filter_pending_invites(docs)
 
                 collected_docs[source] = docs
+                if restrict_email and not docs:
+                    empty_unread[source] = source_since
             except Exception as exc:
                 errors.append(f"Error fetching from '{source}': {exc}")
 
@@ -543,6 +634,11 @@ class DigestCollectTool(BaseTool):
                 )
             else:
                 for source in section_sources:
+                    if source in empty_unread:
+                        section_lines.append(
+                            _empty_unread_line(source, empty_unread[source])
+                        )
+                        continue
                     for doc in collected_docs[source]:
                         section_lines.append(_format_doc(source, doc))
 
